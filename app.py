@@ -210,13 +210,37 @@ def get_pdf_page_count(pdf_bytes: bytes) -> int:
     return len(doc)
 
 
-def create_zip(images: list[dict], hebrew_text: str) -> bytes:
+def resize_to_square(img_bytes: bytes, size: int | None = None) -> bytes:
+    """Crop image to center square and resize. If size is None, keep original resolution."""
+    img = Image.open(io.BytesIO(img_bytes))
+    # Crop to center square
+    side = min(img.width, img.height)
+    left = (img.width - side) // 2
+    top = (img.height - side) // 2
+    img = img.crop((left, top, left + side, top + side))
+    # Resize if specific size requested
+    if size and img.width != size:
+        img = img.resize((size, size), Image.LANCZOS)
+    buf = io.BytesIO()
+    img.convert("RGB").save(buf, format="JPEG", quality=95)
+    return buf.getvalue()
+
+
+def remove_background(img_bytes: bytes) -> bytes:
+    """Remove background using rembg. Returns PNG bytes with transparency."""
+    from rembg import remove
+    result = remove(img_bytes)
+    return result
+
+
+def create_zip(images: list[dict], hebrew_text: str, bg_removed: bool = False) -> bytes:
     """Pack images + text file into a ZIP."""
+    ext = "png" if bg_removed else "jpg"
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("marketing_content_he.txt", hebrew_text.encode("utf-8"))
         for i, img in enumerate(images):
-            zf.writestr(f"product_image_{i+1}.jpg", img["bytes"])
+            zf.writestr(f"product_image_{i+1}.{ext}", img["bytes"])
     buf.seek(0)
     return buf.read()
 
@@ -255,6 +279,15 @@ with col1:
 
     if uploaded:
         st.success(f"✅ {uploaded.name} ({uploaded.size // 1024} KB)")
+
+        st.markdown('<div class="section-title">הגדרות תמונה</div>', unsafe_allow_html=True)
+        image_size = st.radio(
+            "גודל תמונות",
+            options=["900x900", "גודל מקסימלי"],
+            horizontal=True,
+        )
+        remove_bg = st.checkbox("הסרת רקע (רקע שקוף)")
+
         run_btn = st.button("🚀 עבד את האריזה", use_container_width=True)
     else:
         run_btn = False
@@ -275,7 +308,24 @@ if run_btn and uploaded:
             # Step 1 – Extract images
             with st.status("שולף תמונות מה-PDF...", expanded=True) as status:
                 images = extract_images_from_pdf(pdf_bytes)
+                # Apply resize
+                target_size = 900 if image_size == "900x900" else None
+                for img in images:
+                    img["bytes"] = resize_to_square(img["bytes"], target_size)
+                    # Update dimensions
+                    pil = Image.open(io.BytesIO(img["bytes"]))
+                    img["width"], img["height"] = pil.width, pil.height
                 status.update(label=f"נמצאו {len(images)} תמונות מוצר", state="complete")
+
+            # Step 1.5 – Remove background if requested
+            bg_removed = False
+            if remove_bg:
+                with st.status("מסיר רקע מתמונות...", expanded=True) as status:
+                    for i, img in enumerate(images):
+                        img["bytes"] = remove_background(img["bytes"])
+                        status.update(label=f"מסיר רקע... ({i+1}/{len(images)})")
+                    bg_removed = True
+                    status.update(label="רקע הוסר בהצלחה!", state="complete")
 
             # Step 2 – Rasterize all pages + OCR
             with st.status("קורא טקסט מהאריזה...", expanded=True) as status:
@@ -297,6 +347,7 @@ if run_btn and uploaded:
             "packaging_text": packaging_text,
             "hebrew_content": hebrew_content,
             "filename": uploaded.name,
+            "bg_removed": bg_removed,
         }
 
     except anthropic.AuthenticationError:
@@ -316,6 +367,7 @@ if results:
     packaging_text = results["packaging_text"]
     hebrew_content = results["hebrew_content"]
     filename = results["filename"]
+    bg_removed = results.get("bg_removed", False)
 
     with col2:
         st.markdown('<div class="card">', unsafe_allow_html=True)
@@ -344,7 +396,7 @@ if results:
         # ── Download ZIP ──
         st.markdown('<div class="card">', unsafe_allow_html=True)
         st.markdown('<div class="section-title"><span class="step-badge">4</span> הורדה</div>', unsafe_allow_html=True)
-        zip_bytes = create_zip(images, hebrew_content)
+        zip_bytes = create_zip(images, hebrew_content, bg_removed)
         st.download_button(
             label="הורד ZIP (תמונות + תוכן עברי)",
             data=zip_bytes,
