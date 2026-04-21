@@ -202,9 +202,25 @@ def extract_packaging_text(client: anthropic.Anthropic, page_jpegs: list[bytes])
     return msg.content[0].text
 
 
-def generate_hebrew_content(client: anthropic.Anthropic, packaging_text: str) -> str:
-    """Use Claude to turn extracted text into Hebrew website copy."""
-    prompt = MARKETING_TEMPLATE.format(packaging_text=packaging_text)
+def generate_hebrew_content(client: anthropic.Anthropic, packaging_text: str, style: str = "long") -> str:
+    """Use Claude to turn extracted text into Hebrew website copy.
+    style = 'long'  → full 4-paragraph template (default)
+    style = 'short' → minimalistic summary with bullets"""
+    if style == "short":
+        prompt = f"""מתוך טקסט האריזה באנגלית, כתוב תוכן שיווקי **מינימליסטי** בעברית לאתר איקומרס.
+
+טקסט האריזה:
+{packaging_text}
+
+המבנה:
+1. שורת כותרת ראשית: תיאור המוצר + מותג
+2. פסקה קצרה (3-4 משפטים) על מה המוצר עושה ויתרונותיו העיקריים
+3. 3-4 bullets על התכונות הבולטות ביותר
+
+טון שיווקי מקצועי, תמציתי. החזר רק את הטקסט בעברית, בלי הסברים."""
+    else:
+        prompt = MARKETING_TEMPLATE.format(packaging_text=packaging_text)
+
     msg = client.messages.create(
         model="claude-sonnet-4-20250514",
         max_tokens=2000,
@@ -502,35 +518,52 @@ def draw_marketing_strip(image_bytes: bytes, tagline: str, placement: dict) -> b
     return buf.getvalue()
 
 
-def generate_minimal_hebrew_from_image(client: anthropic.Anthropic, img_bytes: bytes) -> str:
-    """Generate minimalistic Hebrew marketing copy from a single product image."""
-    img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-    if max(img.size) > 1200:
-        ratio = 1200 / max(img.size)
-        img = img.resize((int(img.width * ratio), int(img.height * ratio)), Image.LANCZOS)
-    buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=85)
-    b64 = base64.standard_b64encode(buf.getvalue()).decode()
+def generate_hebrew_from_images(client: anthropic.Anthropic, img_bytes_list: list[bytes], style: str = "short") -> str:
+    """Generate Hebrew marketing copy from one or more product images.
+    style = 'short' → minimalistic (1-2 sentences + bullets)
+    style = 'long'  → detailed multi-paragraph copy (like from packaging PDF)"""
+    content_blocks = []
+    for raw in img_bytes_list:
+        img = Image.open(io.BytesIO(raw)).convert("RGB")
+        if max(img.size) > 1200:
+            ratio = 1200 / max(img.size)
+            img = img.resize((int(img.width * ratio), int(img.height * ratio)), Image.LANCZOS)
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=85)
+        b64 = base64.standard_b64encode(buf.getvalue()).decode()
+        content_blocks.append({"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}})
+
+    if style == "long":
+        instruction = (
+            f"קיבלת {len(img_bytes_list)} תמונות של אותו מוצר חשמלי למטבח (המוצר עצמו + אביזרים נלווים / זוויות שונות). "
+            "למד על המוצר מכל התמונות יחד וכתוב תוכן שיווקי **מפורט וארוך** בעברית לאתר איקומרס.\n\n"
+            "המבנה (3-4 פסקאות):\n"
+            "1. שורת כותרת ראשית: תיאור המוצר + שם/מותג אם נראה\n"
+            "2. פסקה ראשית: מה המוצר עושה, יתרונות מרכזיים, אופן שימוש - פסקה רציפה וזורמת\n"
+            "3. פסקת ביצועים ועמידות: חומרים, עיצוב, איכות בנייה (רק מה שרואים)\n"
+            "4. פסקת תכונות: אביזרים נלווים (אם יש בתמונות!), עיצוב, קלות תפעול\n\n"
+            "טון שיווקי נלהב ומקצועי, כמו פרסומת אמיתית. "
+            "אם אתה רואה אביזרים נלווים (מסננות, תוספות, כיסויים) - הזכר אותם. "
+            "אל תמציא מפרט טכני שאתה לא רואה. החזר רק את הטקסט השיווקי בעברית."
+        )
+    else:  # short
+        instruction = (
+            f"קיבלת {len(img_bytes_list)} תמונות של אותו מוצר חשמלי למטבח. "
+            "למד על המוצר מכל התמונות יחד וכתוב תוכן שיווקי **מינימליסטי** בעברית.\n\n"
+            "המבנה:\n"
+            "1. שורת כותרת ראשית: סוג המוצר + שם/מותג אם נראה\n"
+            "2. פסקה קצרה (3-4 משפטים) על מה המוצר עושה ויתרונותיו\n"
+            "3. 3-4 bullets על תכונות בולטות (חומרים, עיצוב, שימושיות, אביזרים אם יש)\n\n"
+            "טון שיווקי מקצועי אך קצר ותמציתי. "
+            "אם אתה רואה אביזרים נלווים בתמונות - הזכר אותם בקצרה. "
+            "אל תמציא מפרט טכני שאתה לא רואה. החזר רק את הטקסט השיווקי בעברית."
+        )
+    content_blocks.append({"type": "text", "text": instruction})
 
     msg = client.messages.create(
         model="claude-sonnet-4-20250514",
-        max_tokens=800,
-        messages=[{
-            "role": "user",
-            "content": [
-                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}},
-                {"type": "text", "text": (
-                    "זו תמונה של מוצר חשמלי למטבח. "
-                    "כתוב תוכן שיווקי מינימליסטי בעברית לאתר איקומרס, בהתבסס רק על מה שאתה רואה בתמונה.\n\n"
-                    "המבנה:\n"
-                    "1. שורת כותרת ראשית: סוג המוצר + שם/מותג אם נראה בתמונה\n"
-                    "2. פסקה קצרה (3-4 משפטים) על מה המוצר עושה ויתרונותיו הנראים לעין\n"
-                    "3. 3-4 bullets על תכונות בולטות (חומרים, עיצוב, שימושיות)\n\n"
-                    "שמור על טון שיווקי מקצועי אך קצר ותמציתי. אל תמציא מפרט טכני שאתה לא רואה בתמונה. "
-                    "החזר רק את הטקסט השיווקי בעברית, בלי הסברים נוספים."
-                )},
-            ],
-        }],
+        max_tokens=2000 if style == "long" else 800,
+        messages=[{"role": "user", "content": content_blocks}],
     )
     return msg.content[0].text
 
@@ -600,19 +633,44 @@ with col1:
 
     upload_mode = st.radio(
         "סוג קלט",
-        options=["PDF של אריזה", "תמונת מוצר בודדת"],
+        options=["PDF של אריזה", "תמונות מוצר"],
         horizontal=True,
     )
 
     if upload_mode == "PDF של אריזה":
-        uploaded = st.file_uploader("גרור PDF של אריזת מוצר", type=["pdf"], label_visibility="collapsed", key="pdf_upl")
+        uploaded_files = st.file_uploader("גרור PDF של אריזת מוצר", type=["pdf"], label_visibility="collapsed", key="pdf_upl")
+        # Normalize to a single file (keep the variable interface consistent)
+        uploaded = uploaded_files
+        upload_count = 1 if uploaded else 0
     else:
-        uploaded = st.file_uploader("גרור תמונת מוצר (JPG/PNG)", type=["jpg", "jpeg", "png", "webp"], label_visibility="collapsed", key="img_upl")
+        uploaded_files = st.file_uploader(
+            "גרור תמונות מוצר (אפשר כמה - למשל מוצר + אביזרים)",
+            type=["jpg", "jpeg", "png", "webp"],
+            label_visibility="collapsed",
+            accept_multiple_files=True,
+            key="img_upl",
+        )
+        uploaded = uploaded_files if uploaded_files else None
+        upload_count = len(uploaded_files) if uploaded_files else 0
 
     if uploaded:
-        st.success(f"✅ {uploaded.name} ({uploaded.size // 1024} KB)")
+        if upload_mode == "PDF של אריזה":
+            st.success(f"✅ {uploaded.name} ({uploaded.size // 1024} KB)")
+        else:
+            st.success(f"✅ הועלו {upload_count} תמונות: " + ", ".join(f.name for f in uploaded_files))
 
-        st.markdown('<div class="section-title">הגדרות תמונה</div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-title">הגדרות</div>', unsafe_allow_html=True)
+
+        # Text length selector
+        default_text_idx = 0 if upload_mode == "PDF של אריזה" else 1
+        text_style = st.radio(
+            "אורך טקסט שיווקי",
+            options=["ארוך ומפורט", "קצר ומינימליסטי"],
+            index=default_text_idx,
+            horizontal=True,
+            help="ארוך = 3-4 פסקאות. קצר = פסקה + bullets",
+        )
+
         image_size = st.radio(
             "גודל תמונות",
             options=["900x900", "גודל מקסימלי"],
@@ -627,6 +685,7 @@ with col1:
         run_btn = st.button("🚀 עבד", use_container_width=True)
     else:
         run_btn = False
+        text_style = "ארוך ומפורט"
         st.info("📂 ממתין לקובץ...")
     st.markdown('</div>', unsafe_allow_html=True)
 
@@ -637,21 +696,29 @@ if run_btn and uploaded:
         st.stop()
 
     client = anthropic.Anthropic(api_key=api_key)
-    file_bytes = uploaded.read()
+    # PDF mode has a single UploadedFile; image mode has a list
+    if upload_mode == "PDF של אריזה":
+        file_bytes = uploaded.read()
+    else:
+        all_image_bytes = [f.read() for f in uploaded_files]
+
+    style_arg = "long" if text_style == "ארוך ומפורט" else "short"
 
     try:
-     if upload_mode == "תמונת מוצר בודדת":
-        # === SINGLE IMAGE MODE ===
+     if upload_mode == "תמונות מוצר":
+        # === MULTI-IMAGE MODE ===
         with col1:
-            with st.status("מעבד תמונה...", expanded=True) as status:
+            with st.status(f"מעבד {len(all_image_bytes)} תמונות...", expanded=True) as status:
                 target_size = 900 if image_size == "900x900" else None
-                resized = resize_to_square(file_bytes, target_size)
-                pil = Image.open(io.BytesIO(resized))
-                images = [{"bytes": resized, "width": pil.width, "height": pil.height, "xref": 0}]
-                status.update(label="תמונה עובדה", state="complete")
+                images = []
+                for i, raw in enumerate(all_image_bytes):
+                    resized = resize_to_square(raw, target_size)
+                    pil = Image.open(io.BytesIO(resized))
+                    images.append({"bytes": resized, "width": pil.width, "height": pil.height, "xref": i})
+                status.update(label=f"{len(images)} תמונות מעובדות", state="complete")
 
-            with st.status("מייצר תוכן שיווקי מינימליסטי בעברית...", expanded=True) as status:
-                hebrew_content = generate_minimal_hebrew_from_image(client, resized)
+            with st.status(f"מייצר תוכן שיווקי ({text_style}) בעברית מכל התמונות...", expanded=True) as status:
+                hebrew_content = generate_hebrew_from_images(client, [img["bytes"] for img in images], style=style_arg)
                 status.update(label="תוכן שיווקי מוכן!", state="complete")
 
             packaging_text = ""
@@ -668,12 +735,15 @@ if run_btn and uploaded:
                     try:
                         from google import genai as google_genai
                         gemini_client = google_genai.Client(api_key=gemini_key)
-                        ref_img = Image.open(io.BytesIO(resized))
-                        ref_buf = io.BytesIO()
-                        ref_img.convert("RGB").save(ref_buf, format="JPEG", quality=92)
-                        ref_bytes_list = [ref_buf.getvalue()]
+                        # Use up to 3 uploaded images as references
+                        ref_bytes_list = []
+                        for img in images[:3]:
+                            ref_pil = Image.open(io.BytesIO(img["bytes"])).convert("RGB")
+                            rb = io.BytesIO()
+                            ref_pil.save(rb, format="JPEG", quality=92)
+                            ref_bytes_list.append(rb.getvalue())
 
-                        with st.status("מזהה 4 חוזקות מוצר ומעצב סצנות תואמות...", expanded=True) as status:
+                        with st.status(f"מזהה 4 חוזקות מוצר ומעצב סצנות תואמות (עם {len(ref_bytes_list)} תמונות רפרנס)...", expanded=True) as status:
                             feature_scenes = generate_feature_scenes(client, "", hebrew_content)
                             status.update(label=f"נבחרו {len(feature_scenes)} חוזקות", state="complete")
 
@@ -760,8 +830,8 @@ if run_btn and uploaded:
                 status.update(label=f"טקסט אריזה חולץ ({num_pages} עמודים)", state="complete")
 
             # Step 3 – Generate Hebrew
-            with st.status("מייצר תוכן שיווקי בעברית...", expanded=True) as status:
-                hebrew_content = generate_hebrew_content(client, packaging_text)
+            with st.status(f"מייצר תוכן שיווקי ({text_style}) בעברית...", expanded=True) as status:
+                hebrew_content = generate_hebrew_content(client, packaging_text, style=style_arg)
                 status.update(label="תוכן שיווקי מוכן!", state="complete")
 
             # Step 4 – Atmosphere images + marketing strips (optional)
