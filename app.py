@@ -311,25 +311,32 @@ def extract_marketing_taglines(client: anthropic.Anthropic, hebrew_content: str)
 def generate_atmosphere_image(gemini_client, product_img_bytes: bytes, prompt: str) -> bytes:
     """Generate a lifestyle image using Gemini 2.5 Flash Image."""
     product_img = Image.open(io.BytesIO(product_img_bytes))
-    response = gemini_client.models.generate_content(
-        model="gemini-2.5-flash-image",
-        contents=[prompt, product_img],
-    )
-    for part in response.parts:
-        if part.inline_data is not None:
-            raw = part.inline_data.data
-            # Normalize to 900x900 square
-            img = Image.open(io.BytesIO(raw))
-            side = min(img.width, img.height)
-            left = (img.width - side) // 2
-            top = (img.height - side) // 2
-            img = img.crop((left, top, left + side, top + side))
-            if img.width != 900:
-                img = img.resize((900, 900), Image.LANCZOS)
-            buf = io.BytesIO()
-            img.convert("RGB").save(buf, format="JPEG", quality=92)
-            return buf.getvalue()
-    raise RuntimeError("Gemini returned no image: " + (response.text or ""))
+    # Try stable name first, fall back to preview name
+    last_err = None
+    for model_name in ("gemini-2.5-flash-image", "gemini-2.5-flash-image-preview"):
+        try:
+            response = gemini_client.models.generate_content(
+                model=model_name,
+                contents=[prompt, product_img],
+            )
+            for part in response.parts:
+                if part.inline_data is not None:
+                    raw = part.inline_data.data
+                    img = Image.open(io.BytesIO(raw))
+                    side = min(img.width, img.height)
+                    left = (img.width - side) // 2
+                    top = (img.height - side) // 2
+                    img = img.crop((left, top, left + side, top + side))
+                    if img.width != 900:
+                        img = img.resize((900, 900), Image.LANCZOS)
+                    buf = io.BytesIO()
+                    img.convert("RGB").save(buf, format="JPEG", quality=92)
+                    return buf.getvalue()
+            # No image in response – capture text for error
+            last_err = RuntimeError(f"{model_name}: no image in response. Text: {response.text or '(empty)'}")
+        except Exception as e:
+            last_err = e
+    raise last_err if last_err else RuntimeError("Unknown Gemini error")
 
 
 def analyze_strip_placement(client: anthropic.Anthropic, image_bytes: bytes) -> dict:
@@ -563,6 +570,7 @@ if run_btn and uploaded:
                             scene_prompts = generate_scene_prompts(client, packaging_text, hebrew_content)
                             status.update(label="תיאורי סצנה מוכנים", state="complete")
 
+                        atmosphere_errors = []
                         with st.status("מייצר תמונות אווירה...", expanded=True) as status:
                             for i, sp in enumerate(scene_prompts):
                                 status.update(label=f"מייצר תמונת אווירה {i+1}/{len(scene_prompts)}...")
@@ -570,8 +578,11 @@ if run_btn and uploaded:
                                     atm = generate_atmosphere_image(gemini_client, ref_bytes, sp)
                                     atmospheres_clean.append(atm)
                                 except Exception as e:
-                                    st.warning(f"כשל ביצירת תמונה {i+1}: {e}")
+                                    atmosphere_errors.append(f"תמונה {i+1}: {type(e).__name__}: {e}")
                             status.update(label=f"נוצרו {len(atmospheres_clean)} תמונות אווירה", state="complete")
+                        # Show errors OUTSIDE the status block so they're visible
+                        for err in atmosphere_errors:
+                            st.error(err)
 
                         if atmospheres_clean:
                             with st.status("מחלץ משפטי שיווק...", expanded=True) as status:
