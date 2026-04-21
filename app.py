@@ -699,8 +699,10 @@ if run_btn and uploaded:
     # PDF mode has a single UploadedFile; image mode has a list
     if upload_mode == "PDF של אריזה":
         file_bytes = uploaded.read()
+        display_filename = uploaded.name
     else:
         all_image_bytes = [f.read() for f in uploaded_files]
+        display_filename = Path(uploaded_files[0].name).stem + "_multi"
 
     style_arg = "long" if text_style == "ארוך ומפורט" else "short"
 
@@ -777,7 +779,7 @@ if run_btn and uploaded:
             "images": images,
             "packaging_text": packaging_text,
             "hebrew_content": hebrew_content,
-            "filename": uploaded.name,
+            "filename": display_filename,
             "bg_removed": bg_removed,
             "atmospheres_clean": atmospheres_clean,
             "atmospheres_striped": atmospheres_striped,
@@ -890,7 +892,7 @@ if run_btn and uploaded:
             "images": images,
             "packaging_text": packaging_text,
             "hebrew_content": hebrew_content,
-            "filename": uploaded.name,
+            "filename": display_filename,
             "bg_removed": bg_removed,
             "atmospheres_clean": atmospheres_clean,
             "atmospheres_striped": atmospheres_striped,
