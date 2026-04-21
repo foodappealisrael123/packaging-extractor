@@ -341,12 +341,17 @@ Taglines already used for other images in this campaign (DO NOT repeat - each im
 
 Tasks:
 
-1. **TAGLINE (Hebrew, 3-6 words)**: Pick a punchy Hebrew marketing phrase that:
+1. **TAGLINE (Hebrew, MAX 6 words, MAX 30 characters total)**: Pick ONE punchy Hebrew marketing phrase.
+   CRITICAL RULES - ANY VIOLATION WILL BREAK THE OUTPUT:
+   - Must be ONE short phrase only. NOT multiple phrases joined together.
+   - NO commas, pipes, bullets, dashes, or separators of any kind.
+   - NO more than 6 words. NO more than 30 characters total.
+   - Example of GOOD tagline: "מנוע עוצמתי של 700 ואט" (24 chars, 5 words)
+   - Example of BAD tagline (too long, has separators): "מנוע עוצמתי, 9 להבים, קיבולת גדולה"
+   - If the user notes above list multiple features, pick ONLY ONE feature for THIS image - don't try to fit them all.
    - Describes a feature or benefit VISIBLE in this specific image (not something invisible).
-   - Is supported by the marketing copy above.
    - Is different from the already-used taglines.
-   - Sounds like a real premium product ad.
-   - If no specific feature is obvious, use a strong general tagline like "עיצוב ללא פשרות", "איכות יוצאת דופן", "מצטיין בכל מטבח" - something that always fits.
+   - If no specific feature is obvious, use a strong general tagline like "עיצוב ללא פשרות", "איכות יוצאת דופן", "מצטיין בכל מטבח".
 
 2. **STRIP PLACEMENT**:
    - Product in UPPER half → strip at BOTTOM. Product in LOWER half → strip at TOP. Centered → prefer BOTTOM.
@@ -378,8 +383,9 @@ Respond with ONLY valid JSON, nothing else. The tagline value MUST be in Hebrew:
             text = text[4:].strip()
     try:
         data = json.loads(text)
+        tagline = _sanitize_tagline(data.get("tagline", "איכות יוצאת דופן"))
         return {
-            "tagline": data.get("tagline", "איכות יוצאת דופן"),
+            "tagline": tagline,
             "strip_position": data.get("strip_position", "bottom"),
             "strip_color": data.get("strip_color", "#8B0000"),
             "text_color": data.get("text_color", "#FFFFFF"),
@@ -387,6 +393,31 @@ Respond with ONLY valid JSON, nothing else. The tagline value MUST be in Hebrew:
         }
     except Exception:
         return {"tagline": "איכות יוצאת דופן", "strip_position": "bottom", "strip_color": "#8B0000", "text_color": "#FFFFFF", "strip_height_ratio": 0.12}
+
+
+def _sanitize_tagline(raw: str) -> str:
+    """Defensive cleanup so the strip drawing never chokes on a bad tagline."""
+    if not raw:
+        return "איכות יוצאת דופן"
+    t = raw.strip()
+    # If tagline contains separators (| , · ; / — \n), keep only first segment
+    for sep in ("|", "·", ";", "\n", "•", " - ", " – ", " — "):
+        if sep in t:
+            t = t.split(sep)[0].strip()
+    # Drop commas (they break bidi rendering on multi-phrase strings)
+    if t.count(",") >= 2:
+        t = t.split(",")[0].strip()
+    # Cap length - PIL can't render super long strings cleanly on a strip
+    if len(t) > 30:
+        # Truncate at the last word boundary under 30 chars
+        words = t.split()
+        out = ""
+        for w in words:
+            if len(out) + len(w) + 1 > 30:
+                break
+            out = (out + " " + w).strip()
+        t = out or t[:30]
+    return t or "איכות יוצאת דופן"
 
 
 def _unused_generate_feature_scenes(client: anthropic.Anthropic, packaging_text: str, hebrew_content: str) -> list[dict]:
