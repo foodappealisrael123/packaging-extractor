@@ -489,7 +489,14 @@ def generate_atmosphere_image(gemini_client, product_img_bytes_list: list[bytes]
     full_prompt = PRODUCT_PRESERVATION_RULES + "\n\n" + prompt
     config = gen_types.GenerateContentConfig(response_modalities=["TEXT", "IMAGE"])
     last_err = None
-    for model_name in ("gemini-2.5-flash-image", "gemini-2.5-flash-image-preview"):
+    # Prioritize Nano Banana Pro (highest quality, best product preservation),
+    # then Nano Banana 2, then standard Nano Banana as fallback.
+    for model_name in (
+        "gemini-3-pro-image-preview",
+        "gemini-3.1-flash-image-preview",
+        "gemini-2.5-flash-image",
+        "gemini-2.5-flash-image-preview",
+    ):
         try:
             response = gemini_client.models.generate_content(
                 model=model_name,
@@ -756,7 +763,7 @@ with col1:
             remove_bg = st.checkbox("הסרת רקע (רקע שקוף)")
         else:
             remove_bg = False
-        gen_atmospheres = st.checkbox("ייצר תמונות אווירה (4 נקיות + 4 עם פס שיווקי) (~$0.16 לקובץ)")
+        gen_atmospheres = st.checkbox("ייצר תמונות אווירה (4 נקיות + 4 עם פס שיווקי) - Nano Banana Pro (~$0.60 לקובץ)")
 
         run_btn = st.button("🚀 עבד", use_container_width=True)
     else:
