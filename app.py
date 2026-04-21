@@ -480,27 +480,43 @@ def extract_marketing_taglines(client: anthropic.Anthropic, hebrew_content: str)
     return json.loads(text)
 
 
-def generate_atmosphere_image(gemini_client, product_img_bytes_list: list[bytes], prompt: str = MINIMAL_ATMOSPHERE_PROMPT) -> bytes:
-    """Generate a lifestyle image using Gemini 2.5 Flash Image, with multiple reference images.
-    Preservation rules are prepended (not appended) to get higher attention weight."""
+def generate_atmosphere_image(
+    gemini_client,
+    product_img_bytes_list: list[bytes],
+    style_ref_bytes_list: list[bytes] | None = None,
+    prompt: str = MINIMAL_ATMOSPHERE_PROMPT,
+) -> bytes:
+    """Generate a lifestyle image using Gemini 2.5 Flash Image.
+    product_img_bytes_list: the actual product photos - must be preserved pixel-accurate.
+    style_ref_bytes_list: OPTIONAL atmosphere/lifestyle reference images - style inspiration only."""
     from google.genai import types as gen_types
     product_imgs = [Image.open(io.BytesIO(b)) for b in product_img_bytes_list]
-    # Put preservation rules FIRST (higher attention), then the scene prompt
-    full_prompt = PRODUCT_PRESERVATION_RULES + "\n\n" + prompt
+    style_imgs = [Image.open(io.BytesIO(b)) for b in (style_ref_bytes_list or [])]
+
+    # Build prompt with clear labels: which images to preserve vs which are style-only
+    if style_imgs:
+        full_prompt = (
+            PRODUCT_PRESERVATION_RULES + "\n\n"
+            f"The first {len(product_imgs)} images show the EXACT PRODUCT - these must be preserved pixel-accurately in your output.\n\n"
+            f"The next {len(style_imgs)} images are ATMOSPHERE/STYLE REFERENCES for inspiration only. "
+            "Study their aesthetic, lighting, composition, mood, and styling - but DO NOT copy their scene, "
+            "DO NOT reproduce their exact composition, and DO NOT copy any text/banners/overlays from them. "
+            "Use them only to understand the visual direction. Create a UNIQUE new scene in that same visual direction.\n\n"
+            + prompt
+        )
+    else:
+        full_prompt = PRODUCT_PRESERVATION_RULES + "\n\n" + prompt
+
     config = gen_types.GenerateContentConfig(response_modalities=["TEXT", "IMAGE"])
     last_err = None
-    # Prioritize Nano Banana Pro (highest quality, best product preservation),
-    # then Nano Banana 2, then standard Nano Banana as fallback.
     for model_name in (
-        "gemini-3-pro-image-preview",
-        "gemini-3.1-flash-image-preview",
         "gemini-2.5-flash-image",
         "gemini-2.5-flash-image-preview",
     ):
         try:
             response = gemini_client.models.generate_content(
                 model=model_name,
-                contents=[full_prompt, *product_imgs],
+                contents=[full_prompt, *product_imgs, *style_imgs],
                 config=config,
             )
             parts = response.candidates[0].content.parts if response.candidates else []
@@ -763,7 +779,24 @@ with col1:
             remove_bg = st.checkbox("הסרת רקע (רקע שקוף)")
         else:
             remove_bg = False
-        gen_atmospheres = st.checkbox("ייצר תמונות אווירה (4 נקיות + 4 עם פס שיווקי) - Nano Banana Pro (~$0.60 לקובץ)")
+        gen_atmospheres = st.checkbox("ייצר תמונות אווירה (4 נקיות + 4 עם פס שיווקי) (~$0.16 לקובץ)")
+
+        style_ref_files = None
+        if gen_atmospheres:
+            with st.expander("🎨 תמונות רפרנס לסגנון אווירה (אופציונלי)", expanded=False):
+                st.caption(
+                    "העלה 1-4 תמונות של אווירות שיווקיות שאתה אוהב (מוצרים דומים, מתחרים, מוד-בורד). "
+                    "האפליקציה תלמד מהסגנון שלהן ליצור תמונות באותו כיוון - בלי להעתיק את הסצנה או טקסטים מהרפרנסים."
+                )
+                style_ref_files = st.file_uploader(
+                    "תמונות רפרנס לסגנון",
+                    type=["jpg", "jpeg", "png", "webp"],
+                    accept_multiple_files=True,
+                    label_visibility="collapsed",
+                    key="style_refs_upl",
+                )
+                if style_ref_files:
+                    st.success(f"{len(style_ref_files)} תמונות רפרנס ישמשו להשראת סגנון")
 
         run_btn = st.button("🚀 עבד", use_container_width=True)
     else:
@@ -828,12 +861,25 @@ if run_btn and uploaded:
                             ref_pil.save(rb, format="JPEG", quality=92)
                             ref_bytes_list.append(rb.getvalue())
 
+                        # Optional style reference images (atmosphere inspiration only)
+                        style_ref_bytes = []
+                        if style_ref_files:
+                            for f in style_ref_files[:4]:
+                                sr_pil = Image.open(io.BytesIO(f.read())).convert("RGB")
+                                if max(sr_pil.size) > 1200:
+                                    ratio = 1200 / max(sr_pil.size)
+                                    sr_pil = sr_pil.resize((int(sr_pil.width * ratio), int(sr_pil.height * ratio)), Image.LANCZOS)
+                                sb = io.BytesIO()
+                                sr_pil.save(sb, format="JPEG", quality=85)
+                                style_ref_bytes.append(sb.getvalue())
+
                         atmosphere_errors = []
-                        with st.status(f"מייצר תמונות אווירה (Gemini בוחר חופשי, עם {len(ref_bytes_list)} תמונות רפרנס)...", expanded=True) as status:
+                        style_note = f" + {len(style_ref_bytes)} רפרנסי סגנון" if style_ref_bytes else ""
+                        with st.status(f"מייצר תמונות אווירה ({len(ref_bytes_list)} תמונות מוצר{style_note})...", expanded=True) as status:
                             for i in range(4):
                                 status.update(label=f"מייצר תמונה {i+1}/4 - דיוק מוצר מקסימלי...")
                                 try:
-                                    atm = generate_atmosphere_image(gemini_client, ref_bytes_list)
+                                    atm = generate_atmosphere_image(gemini_client, ref_bytes_list, style_ref_bytes or None)
                                     atmospheres_clean.append(atm)
                                 except Exception as e:
                                     atmosphere_errors.append(f"תמונה {i+1}: {type(e).__name__}: {e}")
@@ -936,12 +982,25 @@ if run_btn and uploaded:
                             ref_pil.save(rb, format="JPEG", quality=92)
                             ref_bytes_list.append(rb.getvalue())
 
+                        # Optional style reference images (atmosphere inspiration only)
+                        style_ref_bytes = []
+                        if style_ref_files:
+                            for f in style_ref_files[:4]:
+                                sr_pil = Image.open(io.BytesIO(f.read())).convert("RGB")
+                                if max(sr_pil.size) > 1200:
+                                    ratio = 1200 / max(sr_pil.size)
+                                    sr_pil = sr_pil.resize((int(sr_pil.width * ratio), int(sr_pil.height * ratio)), Image.LANCZOS)
+                                sb = io.BytesIO()
+                                sr_pil.save(sb, format="JPEG", quality=85)
+                                style_ref_bytes.append(sb.getvalue())
+
                         atmosphere_errors = []
-                        with st.status(f"מייצר תמונות אווירה (Gemini בוחר חופשי, עם {len(ref_bytes_list)} תמונות רפרנס)...", expanded=True) as status:
+                        style_note = f" + {len(style_ref_bytes)} רפרנסי סגנון" if style_ref_bytes else ""
+                        with st.status(f"מייצר תמונות אווירה ({len(ref_bytes_list)} תמונות מוצר{style_note})...", expanded=True) as status:
                             for i in range(4):
                                 status.update(label=f"מייצר תמונה {i+1}/4 - דיוק מוצר מקסימלי...")
                                 try:
-                                    atm = generate_atmosphere_image(gemini_client, ref_bytes_list)
+                                    atm = generate_atmosphere_image(gemini_client, ref_bytes_list, style_ref_bytes or None)
                                     atmospheres_clean.append(atm)
                                 except Exception as e:
                                     atmosphere_errors.append(f"תמונה {i+1}: {type(e).__name__}: {e}")
