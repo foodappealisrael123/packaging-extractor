@@ -202,16 +202,21 @@ def extract_packaging_text(client: anthropic.Anthropic, page_jpegs: list[bytes])
     return msg.content[0].text
 
 
-def generate_hebrew_content(client: anthropic.Anthropic, packaging_text: str, style: str = "long") -> str:
+def generate_hebrew_content(client: anthropic.Anthropic, packaging_text: str, style: str = "long", user_notes: str = "") -> str:
     """Use Claude to turn extracted text into Hebrew website copy.
     style = 'long'  → full 4-paragraph template (default)
-    style = 'short' → minimalistic summary with bullets"""
+    style = 'short' → minimalistic summary with bullets
+    user_notes      → optional free-text user emphasis/instructions."""
+    notes_block = ""
+    if user_notes.strip():
+        notes_block = f"\n\n=== הערות חשובות מהמזמין (קח אותן בחשבון בכתיבה) ===\n{user_notes.strip()}\n===\n"
+
     if style == "short":
         prompt = f"""מתוך טקסט האריזה באנגלית, כתוב תוכן שיווקי **מינימליסטי** בעברית לאתר איקומרס.
 
 טקסט האריזה:
 {packaging_text}
-
+{notes_block}
 המבנה:
 1. שורת כותרת ראשית: תיאור המוצר + מותג
 2. פסקה קצרה (3-4 משפטים) על מה המוצר עושה ויתרונותיו העיקריים
@@ -219,7 +224,7 @@ def generate_hebrew_content(client: anthropic.Anthropic, packaging_text: str, st
 
 טון שיווקי מקצועי, תמציתי. החזר רק את הטקסט בעברית, בלי הסברים."""
     else:
-        prompt = MARKETING_TEMPLATE.format(packaging_text=packaging_text)
+        prompt = MARKETING_TEMPLATE.format(packaging_text=packaging_text) + notes_block
 
     msg = client.messages.create(
         model="claude-sonnet-4-20250514",
@@ -314,11 +319,14 @@ MINIMAL_ATMOSPHERE_PROMPT = (
 )
 
 
-def analyze_image_for_strip(client: anthropic.Anthropic, image_bytes: bytes, hebrew_content: str, used_taglines: list[str]) -> dict:
+def analyze_image_for_strip(client: anthropic.Anthropic, image_bytes: bytes, hebrew_content: str, used_taglines: list[str], user_notes: str = "") -> dict:
     """Ask Claude Vision to (1) pick a Hebrew tagline matching what's ACTUALLY VISIBLE in the image,
     (2) choose strip position/color/text color. Called AFTER atmosphere generation."""
     b64 = base64.standard_b64encode(image_bytes).decode()
     used_str = ", ".join(f'"{t}"' for t in used_taglines) if used_taglines else "(none yet)"
+    notes_block = ""
+    if user_notes.strip():
+        notes_block = f"\n\nImportant user notes (incorporate into your tagline choice where relevant):\n---\n{user_notes.strip()}\n---\n"
     prompt = f"""You are designing a marketing banner for an e-commerce product image.
 
 This is a lifestyle photograph of a kitchen product. Your job is to pick a Hebrew marketing tagline that matches what is ACTUALLY VISIBLE in this specific image, and decide strip styling.
@@ -327,7 +335,7 @@ Hebrew marketing copy (brand voice + available features to draw from):
 ---
 {hebrew_content}
 ---
-
+{notes_block}
 Taglines already used for other images in this campaign (DO NOT repeat - each image must have a unique message):
 {used_str}
 
@@ -485,10 +493,12 @@ def generate_atmosphere_image(
     product_img_bytes_list: list[bytes],
     style_ref_bytes_list: list[bytes] | None = None,
     prompt: str = MINIMAL_ATMOSPHERE_PROMPT,
+    user_notes: str = "",
 ) -> bytes:
     """Generate a lifestyle image using Gemini 2.5 Flash Image.
     product_img_bytes_list: the actual product photos - must be preserved pixel-accurate.
-    style_ref_bytes_list: OPTIONAL atmosphere/lifestyle reference images - style inspiration only."""
+    style_ref_bytes_list: OPTIONAL atmosphere/lifestyle reference images - style inspiration only.
+    user_notes: optional user instructions/emphasis to steer the atmosphere."""
     from google.genai import types as gen_types
     product_imgs = [Image.open(io.BytesIO(b)) for b in product_img_bytes_list]
     style_imgs = [Image.open(io.BytesIO(b)) for b in (style_ref_bytes_list or [])]
@@ -506,6 +516,12 @@ def generate_atmosphere_image(
         )
     else:
         full_prompt = PRODUCT_PRESERVATION_RULES + "\n\n" + prompt
+
+    if user_notes.strip():
+        full_prompt += (
+            "\n\nAdditional user instructions for this image (follow these, but never at the cost of product preservation):\n"
+            f"{user_notes.strip()}"
+        )
 
     config = gen_types.GenerateContentConfig(response_modalities=["TEXT", "IMAGE"])
     last_err = None
@@ -617,10 +633,11 @@ def draw_marketing_strip(image_bytes: bytes, tagline: str, placement: dict) -> b
     return buf.getvalue()
 
 
-def generate_hebrew_from_images(client: anthropic.Anthropic, img_bytes_list: list[bytes], style: str = "short") -> str:
+def generate_hebrew_from_images(client: anthropic.Anthropic, img_bytes_list: list[bytes], style: str = "short", user_notes: str = "") -> str:
     """Generate Hebrew marketing copy from one or more product images.
     style = 'short' → minimalistic (1-2 sentences + bullets)
-    style = 'long'  → detailed multi-paragraph copy (like from packaging PDF)"""
+    style = 'long'  → detailed multi-paragraph copy (like from packaging PDF)
+    user_notes      → optional user emphasis/instructions."""
     content_blocks = []
     for raw in img_bytes_list:
         img = Image.open(io.BytesIO(raw)).convert("RGB")
@@ -656,6 +673,11 @@ def generate_hebrew_from_images(client: anthropic.Anthropic, img_bytes_list: lis
             "טון שיווקי מקצועי אך קצר ותמציתי. "
             "אם אתה רואה אביזרים נלווים בתמונות - הזכר אותם בקצרה. "
             "אל תמציא מפרט טכני שאתה לא רואה. החזר רק את הטקסט השיווקי בעברית."
+        )
+    if user_notes.strip():
+        instruction += (
+            f"\n\n=== הערות חשובות מהמזמין (קח אותן בחשבון בכתיבה) ===\n"
+            f"{user_notes.strip()}\n===\n"
         )
     content_blocks.append({"type": "text", "text": instruction})
 
@@ -779,6 +801,20 @@ with col1:
             remove_bg = st.checkbox("הסרת רקע (רקע שקוף)")
         else:
             remove_bg = False
+        user_notes = st.text_area(
+            "הערות משלך על המוצר (אופציונלי)",
+            placeholder=(
+                "למשל: 'תדגישו את הידית הארגונומית', 'זה מוצר פרימיום', "
+                "'קהל היעד אמהות צעירות', 'תמונות אווירה עם מראה מינימליסטי', "
+                "'אל תזכירו מפרט טכני', וכו'"
+            ),
+            height=100,
+            help=(
+                "כל מה שתכתוב כאן יילקח בחשבון: בטקסט השיווקי, בבחירת המשפטים לפסי השיווק, "
+                "ובסגנון תמונות האווירה. אופציונלי - לא חובה למלא."
+            ),
+        )
+
         gen_atmospheres = st.checkbox("ייצר תמונות אווירה (4 נקיות + 4 עם פס שיווקי) (~$0.16 לקובץ)")
 
         style_ref_files = None
@@ -802,6 +838,7 @@ with col1:
     else:
         run_btn = False
         text_style = "ארוך ומפורט"
+        user_notes = ""
         st.info("📂 ממתין לקובץ...")
     st.markdown('</div>', unsafe_allow_html=True)
 
@@ -836,7 +873,7 @@ if run_btn and uploaded:
                 status.update(label=f"{len(images)} תמונות מעובדות", state="complete")
 
             with st.status(f"מייצר תוכן שיווקי ({text_style}) בעברית מכל התמונות...", expanded=True) as status:
-                hebrew_content = generate_hebrew_from_images(client, [img["bytes"] for img in images], style=style_arg)
+                hebrew_content = generate_hebrew_from_images(client, [img["bytes"] for img in images], style=style_arg, user_notes=user_notes)
                 status.update(label="תוכן שיווקי מוכן!", state="complete")
 
             packaging_text = ""
@@ -879,7 +916,7 @@ if run_btn and uploaded:
                             for i in range(4):
                                 status.update(label=f"מייצר תמונה {i+1}/4 - דיוק מוצר מקסימלי...")
                                 try:
-                                    atm = generate_atmosphere_image(gemini_client, ref_bytes_list, style_ref_bytes or None)
+                                    atm = generate_atmosphere_image(gemini_client, ref_bytes_list, style_ref_bytes or None, user_notes=user_notes)
                                     atmospheres_clean.append(atm)
                                 except Exception as e:
                                     atmosphere_errors.append(f"תמונה {i+1}: {type(e).__name__}: {e}")
@@ -892,7 +929,7 @@ if run_btn and uploaded:
                                 used_taglines = []
                                 for i, atm in enumerate(atmospheres_clean):
                                     status.update(label=f"מתאים טקסט לתמונה {i+1}/{len(atmospheres_clean)}...")
-                                    placement = analyze_image_for_strip(client, atm, hebrew_content, used_taglines)
+                                    placement = analyze_image_for_strip(client, atm, hebrew_content, used_taglines, user_notes=user_notes)
                                     used_taglines.append(placement["tagline"])
                                     striped = draw_marketing_strip(atm, placement["tagline"], placement)
                                     atmospheres_striped.append(striped)
@@ -958,7 +995,7 @@ if run_btn and uploaded:
 
             # Step 3 – Generate Hebrew
             with st.status(f"מייצר תוכן שיווקי ({text_style}) בעברית...", expanded=True) as status:
-                hebrew_content = generate_hebrew_content(client, packaging_text, style=style_arg)
+                hebrew_content = generate_hebrew_content(client, packaging_text, style=style_arg, user_notes=user_notes)
                 status.update(label="תוכן שיווקי מוכן!", state="complete")
 
             # Step 4 – Atmosphere images + marketing strips (optional)
@@ -1000,7 +1037,7 @@ if run_btn and uploaded:
                             for i in range(4):
                                 status.update(label=f"מייצר תמונה {i+1}/4 - דיוק מוצר מקסימלי...")
                                 try:
-                                    atm = generate_atmosphere_image(gemini_client, ref_bytes_list, style_ref_bytes or None)
+                                    atm = generate_atmosphere_image(gemini_client, ref_bytes_list, style_ref_bytes or None, user_notes=user_notes)
                                     atmospheres_clean.append(atm)
                                 except Exception as e:
                                     atmosphere_errors.append(f"תמונה {i+1}: {type(e).__name__}: {e}")
@@ -1013,7 +1050,7 @@ if run_btn and uploaded:
                                 used_taglines = []
                                 for i, atm in enumerate(atmospheres_clean):
                                     status.update(label=f"מתאים טקסט לתמונה {i+1}/{len(atmospheres_clean)}...")
-                                    placement = analyze_image_for_strip(client, atm, hebrew_content, used_taglines)
+                                    placement = analyze_image_for_strip(client, atm, hebrew_content, used_taglines, user_notes=user_notes)
                                     used_taglines.append(placement["tagline"])
                                     striped = draw_marketing_strip(atm, placement["tagline"], placement)
                                     atmospheres_striped.append(striped)
