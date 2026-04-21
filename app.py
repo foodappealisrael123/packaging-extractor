@@ -277,6 +277,18 @@ def is_product_image(client: anthropic.Anthropic, img_bytes: bytes) -> bool:
     return answer.startswith("Y")
 
 
+PRODUCT_PRESERVATION_RULES = (
+    " CRITICAL PRODUCT INTEGRITY RULES (must appear in every prompt): "
+    "Show the product EXACTLY as it appears in the reference photos - same shape, same color, "
+    "same number of pieces, same handles, same lid, same proportions. "
+    "DO NOT add, remove, or modify any element of the product itself. "
+    "DO NOT invent extra handles, pots, pans, buttons, parts, or accessories that are not in the reference. "
+    "DO NOT change the product's material, finish, or dimensions. "
+    "Your job is ONLY to change the SCENE AROUND the product (background, lighting, food, styling) - "
+    "the product itself must be a perfect visual match to the reference."
+)
+
+
 def generate_scene_prompts(client: anthropic.Anthropic, packaging_text: str, hebrew_content: str) -> list[str]:
     """Use Claude to generate 4 English scene prompts for Gemini image generation."""
     prompt = f"""You are a creative director for product photography. A Food Appeal kitchen appliance needs 4 lifestyle images.
@@ -287,7 +299,7 @@ Product info (English text from packaging):
 Hebrew marketing copy:
 {hebrew_content}
 
-Generate 4 detailed English prompts for AI image generation. Each prompt will be combined with a reference product photo to create a lifestyle image:
+Generate 4 detailed English prompts for AI image generation. Each prompt will be combined with reference product photos to create a lifestyle image:
 - Prompt 1 & 2: The product IN USE with relevant food inside/on it (e.g., for slow cooker → stew inside; for waffle maker → fresh waffles). Choose FOODS THAT MAKE SENSE for this specific appliance.
 - Prompt 3 & 4: The product in a BEAUTIFUL KITCHEN SCENE (on a counter, styled with plates/ingredients nearby, natural light, modern home).
 
@@ -295,8 +307,10 @@ Each prompt should:
 - Describe lighting (warm morning light, soft overhead, etc.)
 - Describe composition (close-up, 3/4 angle, etc.)
 - Describe styling (herbs, ingredients, plates)
-- Mention the product should remain identical to the reference
 - Be 2-3 sentences, photography-style
+- Focus ONLY on the scene/environment - the product should remain exactly as in the reference
+
+Every prompt you write MUST end with this exact text: "{PRODUCT_PRESERVATION_RULES}"
 
 Respond with ONLY a valid JSON array of 4 strings, nothing else:
 ["prompt 1", "prompt 2", "prompt 3", "prompt 4"]"""
@@ -343,17 +357,20 @@ def extract_marketing_taglines(client: anthropic.Anthropic, hebrew_content: str)
     return json.loads(text)
 
 
-def generate_atmosphere_image(gemini_client, product_img_bytes: bytes, prompt: str) -> bytes:
-    """Generate a lifestyle image using Gemini 2.5 Flash Image."""
+def generate_atmosphere_image(gemini_client, product_img_bytes_list: list[bytes], prompt: str) -> bytes:
+    """Generate a lifestyle image using Gemini 2.5 Flash Image, with multiple reference images."""
     from google.genai import types as gen_types
-    product_img = Image.open(io.BytesIO(product_img_bytes))
+    product_imgs = [Image.open(io.BytesIO(b)) for b in product_img_bytes_list]
+    # Safety belt: ensure preservation rules are in the prompt even if Claude omitted them
+    if "PRODUCT INTEGRITY" not in prompt:
+        prompt = prompt.rstrip() + " " + PRODUCT_PRESERVATION_RULES
     config = gen_types.GenerateContentConfig(response_modalities=["TEXT", "IMAGE"])
     last_err = None
     for model_name in ("gemini-2.5-flash-image", "gemini-2.5-flash-image-preview"):
         try:
             response = gemini_client.models.generate_content(
                 model=model_name,
-                contents=[prompt, product_img],
+                contents=[prompt, *product_imgs],
                 config=config,
             )
             parts = response.candidates[0].content.parts if response.candidates else []
@@ -624,7 +641,7 @@ if run_btn and uploaded:
                         ref_img = Image.open(io.BytesIO(resized))
                         ref_buf = io.BytesIO()
                         ref_img.convert("RGB").save(ref_buf, format="JPEG", quality=92)
-                        ref_bytes = ref_buf.getvalue()
+                        ref_bytes_list = [ref_buf.getvalue()]
 
                         with st.status("יוצר תיאורי סצנה...", expanded=True) as status:
                             scene_prompts = generate_scene_prompts(client, "", hebrew_content)
@@ -635,7 +652,7 @@ if run_btn and uploaded:
                             for i, sp in enumerate(scene_prompts):
                                 status.update(label=f"מייצר תמונת אווירה {i+1}/{len(scene_prompts)}...")
                                 try:
-                                    atm = generate_atmosphere_image(gemini_client, ref_bytes, sp)
+                                    atm = generate_atmosphere_image(gemini_client, ref_bytes_list, sp)
                                     atmospheres_clean.append(atm)
                                 except Exception as e:
                                     atmosphere_errors.append(f"תמונה {i+1}: {type(e).__name__}: {e}")
@@ -732,23 +749,25 @@ if run_btn and uploaded:
                     try:
                         from google import genai as google_genai
                         gemini_client = google_genai.Client(api_key=gemini_key)
-                        # Use the largest product image (first in the sorted list)
-                        # Must be original (not bg-removed PNG) - use JPEG-encoded version
-                        ref_img = Image.open(io.BytesIO(images[0]["bytes"]))
-                        ref_buf = io.BytesIO()
-                        ref_img.convert("RGB").save(ref_buf, format="JPEG", quality=92)
-                        ref_bytes = ref_buf.getvalue()
+                        # Use top-3 product images as references (they're already sorted by area
+                        # and filtered to clean product shots, so these are the best representatives)
+                        ref_bytes_list = []
+                        for img in images[:3]:
+                            ref_pil = Image.open(io.BytesIO(img["bytes"])).convert("RGB")
+                            rb = io.BytesIO()
+                            ref_pil.save(rb, format="JPEG", quality=92)
+                            ref_bytes_list.append(rb.getvalue())
 
                         with st.status("יוצר תיאורי סצנה...", expanded=True) as status:
                             scene_prompts = generate_scene_prompts(client, packaging_text, hebrew_content)
                             status.update(label="תיאורי סצנה מוכנים", state="complete")
 
                         atmosphere_errors = []
-                        with st.status("מייצר תמונות אווירה...", expanded=True) as status:
+                        with st.status(f"מייצר תמונות אווירה (עם {len(ref_bytes_list)} תמונות רפרנס)...", expanded=True) as status:
                             for i, sp in enumerate(scene_prompts):
                                 status.update(label=f"מייצר תמונת אווירה {i+1}/{len(scene_prompts)}...")
                                 try:
-                                    atm = generate_atmosphere_image(gemini_client, ref_bytes, sp)
+                                    atm = generate_atmosphere_image(gemini_client, ref_bytes_list, sp)
                                     atmospheres_clean.append(atm)
                                 except Exception as e:
                                     atmosphere_errors.append(f"תמונה {i+1}: {type(e).__name__}: {e}")
