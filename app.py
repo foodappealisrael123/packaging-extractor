@@ -319,55 +319,51 @@ MINIMAL_ATMOSPHERE_PROMPT = (
 )
 
 
+FALLBACK_TAGLINES = [
+    "איכות יוצאת דופן",
+    "עיצוב ללא פשרות",
+    "מצטיין בכל מטבח",
+    "חוויית שימוש מושלמת",
+    "מקצועיות בכל פרט",
+    "פשוט לאהוב",
+]
+
+
 def analyze_image_for_strip(client: anthropic.Anthropic, image_bytes: bytes, hebrew_content: str, used_taglines: list[str], user_notes: str = "") -> dict:
-    """Ask Claude Vision to (1) pick a Hebrew tagline matching what's ACTUALLY VISIBLE in the image,
-    (2) choose strip position/color/text color. Called AFTER atmosphere generation."""
+    """Ask Claude Vision to pick a Hebrew tagline + strip styling for the given atmosphere image.
+    Uses a deliberately SHORT prompt to keep Claude's Hebrew output clean."""
     b64 = base64.standard_b64encode(image_bytes).decode()
-    used_str = ", ".join(f'"{t}"' for t in used_taglines) if used_taglines else "(none yet)"
-    notes_block = ""
-    if user_notes.strip():
-        notes_block = f"\n\nImportant user notes (incorporate into your tagline choice where relevant):\n---\n{user_notes.strip()}\n---\n"
-    prompt = f"""You are designing a marketing banner for an e-commerce product image.
+    # Keep context compact - long context was causing Claude to produce garbled Hebrew.
+    short_content = (hebrew_content or "").strip()
+    if len(short_content) > 600:
+        short_content = short_content[:600] + "..."
+    short_notes = (user_notes or "").strip()
+    if len(short_notes) > 200:
+        short_notes = short_notes[:200] + "..."
 
-This is a lifestyle photograph of a kitchen product. Your job is to pick a Hebrew marketing tagline that matches what is ACTUALLY VISIBLE in this specific image, and decide strip styling.
+    used_str = " / ".join(used_taglines) if used_taglines else "(none)"
 
-Hebrew marketing copy (brand voice + available features to draw from):
----
-{hebrew_content}
----
-{notes_block}
-Taglines already used for other images in this campaign (DO NOT repeat - each image must have a unique message):
-{used_str}
+    prompt = f"""Look at this product lifestyle photo. Pick a short Hebrew marketing tagline for it.
 
-Tasks:
+Product marketing copy (for context only):
+{short_content}
 
-1. **TAGLINE (Hebrew, MAX 6 words, MAX 30 characters total)**: Pick ONE punchy Hebrew marketing phrase.
-   CRITICAL RULES - ANY VIOLATION WILL BREAK THE OUTPUT:
-   - Must be ONE short phrase only. NOT multiple phrases joined together.
-   - NO commas, pipes, bullets, dashes, or separators of any kind.
-   - NO more than 6 words. NO more than 30 characters total.
-   - Example of GOOD tagline: "מנוע עוצמתי של 700 ואט" (24 chars, 5 words)
-   - Example of BAD tagline (too long, has separators): "מנוע עוצמתי, 9 להבים, קיבולת גדולה"
-   - If the user notes above list multiple features, pick ONLY ONE feature for THIS image - don't try to fit them all.
-   - Describes a feature or benefit VISIBLE in this specific image (not something invisible).
-   - Is different from the already-used taglines.
-   - If no specific feature is obvious, use a strong general tagline like "עיצוב ללא פשרות", "איכות יוצאת דופן", "מצטיין בכל מטבח".
+User emphasis (optional):
+{short_notes}
 
-2. **STRIP PLACEMENT**:
-   - Product in UPPER half → strip at BOTTOM. Product in LOWER half → strip at TOP. Centered → prefer BOTTOM.
+Already used taglines (avoid repeating): {used_str}
 
-3. **COLORS**:
-   - strip_color: harmonizes with or boldly contrasts the image (deep red, dark navy, forest green, warm black, or product's brand color).
-   - text_color: white on dark strips, dark on light strips - must be highly readable.
+RETURN FORMAT: JSON object with these exact keys:
+- "tagline": Hebrew text, 3 to 6 words MAX, 30 characters MAX. ONE simple phrase. NO commas, NO pipes, NO dashes, NO separators. Must be real Hebrew words forming a meaningful phrase.
+- "strip_position": "top" if product is in lower half of image, "bottom" if product is in upper half, else "bottom"
+- "strip_color": "#RRGGBB" - deep color that contrasts the image
+- "text_color": "#RRGGBB" - white on dark strips, dark on light
 
-4. **SIZE**: strip_height_ratio between 0.10 and 0.14.
-
-Respond with ONLY valid JSON, nothing else. The tagline value MUST be in Hebrew:
-{{"tagline": "המשפט בעברית", "strip_position": "top" or "bottom", "strip_color": "#RRGGBB", "text_color": "#RRGGBB", "strip_height_ratio": 0.12}}"""
+Output ONLY the JSON, no other text. Example: {{"tagline":"איכות יוצאת דופן","strip_position":"bottom","strip_color":"#8B0000","text_color":"#FFFFFF"}}"""
 
     msg = client.messages.create(
         model="claude-sonnet-4-20250514",
-        max_tokens=500,
+        max_tokens=300,
         messages=[{
             "role": "user",
             "content": [
@@ -383,7 +379,11 @@ Respond with ONLY valid JSON, nothing else. The tagline value MUST be in Hebrew:
             text = text[4:].strip()
     try:
         data = json.loads(text)
-        tagline = _sanitize_tagline(data.get("tagline", "איכות יוצאת דופן"))
+        raw_tagline = data.get("tagline", "")
+        tagline = _sanitize_tagline(raw_tagline)
+        # If tagline looks like gibberish (not valid Hebrew), use a fallback not yet used
+        if _looks_like_gibberish(tagline):
+            tagline = _pick_fallback_tagline(used_taglines)
         return {
             "tagline": tagline,
             "strip_position": data.get("strip_position", "bottom"),
@@ -392,27 +392,53 @@ Respond with ONLY valid JSON, nothing else. The tagline value MUST be in Hebrew:
             "strip_height_ratio": float(data.get("strip_height_ratio", 0.12)),
         }
     except Exception:
-        return {"tagline": "איכות יוצאת דופן", "strip_position": "bottom", "strip_color": "#8B0000", "text_color": "#FFFFFF", "strip_height_ratio": 0.12}
+        return {"tagline": _pick_fallback_tagline(used_taglines), "strip_position": "bottom", "strip_color": "#8B0000", "text_color": "#FFFFFF", "strip_height_ratio": 0.12}
+
+
+def _pick_fallback_tagline(used: list[str]) -> str:
+    for t in FALLBACK_TAGLINES:
+        if t not in used:
+            return t
+    return FALLBACK_TAGLINES[0]
+
+
+def _looks_like_gibberish(text: str) -> bool:
+    """Heuristic: real Hebrew marketing phrases contain common function words/patterns.
+    Gibberish has random letter combinations that don't form real words."""
+    if not text or len(text) < 4:
+        return True
+    # Common Hebrew particles/words - at least one should appear in a real tagline
+    common_markers = [
+        "של", "את", "על", "עם", "ב", "ל", "לכל", "יותר", "מעל", "הכל",
+        "איכות", "עיצוב", "מקצוע", "חזק", "קל", "פשוט", "מושלם", "מעולה",
+        "לנוחות", "לאורך", "בכל", "גדול", "קטן", "חדש", "טוב", "מהיר",
+        "חכם", "חסכון", "יעיל", "מדויק", "אמין", "מיוחד", "ייחודי", "נקי",
+        "חם", "קר", "רך", "עוצמה", "ביצועים", "טכנולוגיה", "חדשנות",
+    ]
+    for marker in common_markers:
+        if marker in text:
+            return False
+    return True
 
 
 def _sanitize_tagline(raw: str) -> str:
     """Defensive cleanup so the strip drawing never chokes on a bad tagline."""
     if not raw:
         return "איכות יוצאת דופן"
-    t = raw.strip()
-    # If tagline contains separators (| , · ; / — \n), keep only first segment
-    for sep in ("|", "·", ";", "\n", "•", " - ", " – ", " — "):
+    t = raw.strip().strip('"').strip("'").strip()
+    # Strip at ANY separator - keep only first segment
+    for sep in (",", "|", "·", ";", "\n", "•", " - ", " – ", " — ", " / "):
         if sep in t:
             t = t.split(sep)[0].strip()
-    # Drop commas (they break bidi rendering on multi-phrase strings)
-    if t.count(",") >= 2:
-        t = t.split(",")[0].strip()
-    # Cap length - PIL can't render super long strings cleanly on a strip
+    # Cap word count
+    words = t.split()
+    if len(words) > 6:
+        words = words[:6]
+        t = " ".join(words)
+    # Cap character length - truncate at last word boundary under 30 chars
     if len(t) > 30:
-        # Truncate at the last word boundary under 30 chars
-        words = t.split()
         out = ""
-        for w in words:
+        for w in t.split():
             if len(out) + len(w) + 1 > 30:
                 break
             out = (out + " " + w).strip()
