@@ -310,16 +310,19 @@ def extract_marketing_taglines(client: anthropic.Anthropic, hebrew_content: str)
 
 def generate_atmosphere_image(gemini_client, product_img_bytes: bytes, prompt: str) -> bytes:
     """Generate a lifestyle image using Gemini 2.5 Flash Image."""
+    from google.genai import types as gen_types
     product_img = Image.open(io.BytesIO(product_img_bytes))
-    # Try stable name first, fall back to preview name
+    config = gen_types.GenerateContentConfig(response_modalities=["TEXT", "IMAGE"])
     last_err = None
     for model_name in ("gemini-2.5-flash-image", "gemini-2.5-flash-image-preview"):
         try:
             response = gemini_client.models.generate_content(
                 model=model_name,
                 contents=[prompt, product_img],
+                config=config,
             )
-            for part in response.parts:
+            parts = response.candidates[0].content.parts if response.candidates else []
+            for part in parts:
                 if part.inline_data is not None:
                     raw = part.inline_data.data
                     img = Image.open(io.BytesIO(raw))
@@ -332,7 +335,6 @@ def generate_atmosphere_image(gemini_client, product_img_bytes: bytes, prompt: s
                     buf = io.BytesIO()
                     img.convert("RGB").save(buf, format="JPEG", quality=92)
                     return buf.getvalue()
-            # No image in response – capture text for error
             last_err = RuntimeError(f"{model_name}: no image in response. Text: {response.text or '(empty)'}")
         except Exception as e:
             last_err = e
@@ -492,7 +494,7 @@ with col1:
             horizontal=True,
         )
         remove_bg = st.checkbox("הסרת רקע (רקע שקוף)")
-        gen_atmospheres = st.checkbox("ייצר 4 תמונות אווירה שיווקיות (~$0.16 לקובץ)")
+        gen_atmospheres = st.checkbox("ייצר תמונות אווירה (4 נקיות + 4 עם פס שיווקי) (~$0.16 לקובץ)")
 
         run_btn = st.button("🚀 עבד את האריזה", use_container_width=True)
     else:
