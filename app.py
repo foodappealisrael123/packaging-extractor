@@ -242,6 +242,41 @@ def remove_background(img_bytes: bytes) -> bytes:
     return result
 
 
+def is_product_image(client: anthropic.Anthropic, img_bytes: bytes) -> bool:
+    """Use Claude Vision to decide if an image is a clean product shot worth keeping.
+    Filters out: designer PSD mockups, instructional diagrams, small logos/icons,
+    images with overlaid instructional text, multi-product collages."""
+    # Compress to keep API cost low
+    img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+    if max(img.size) > 800:
+        ratio = 800 / max(img.size)
+        img = img.resize((int(img.width * ratio), int(img.height * ratio)), Image.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=80)
+    b64 = base64.standard_b64encode(buf.getvalue()).decode()
+
+    msg = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=50,
+        messages=[{
+            "role": "user",
+            "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}},
+                {"type": "text", "text": (
+                    "Is this a clean product photograph suitable for use on an e-commerce website? "
+                    "Reply NO if the image contains: overlaid instructional text like 'PSD', 'TRANSPARENT', 'MOCKUP'; "
+                    "visible arrows or step-by-step diagrams; checkered transparency background; icons/logos only; "
+                    "or a mosaic/collage of many different products. "
+                    "Reply YES if it's a professional product shot, a clean food/lifestyle photo, or a clean product-in-use shot. "
+                    "Reply with only the single word YES or NO."
+                )},
+            ],
+        }],
+    )
+    answer = msg.content[0].text.strip().upper()
+    return answer.startswith("Y")
+
+
 def generate_scene_prompts(client: anthropic.Anthropic, packaging_text: str, hebrew_content: str) -> list[str]:
     """Use Claude to generate 4 English scene prompts for Gemini image generation."""
     prompt = f"""You are a creative director for product photography. A Food Appeal kitchen appliance needs 4 lifestyle images.
@@ -420,6 +455,39 @@ def draw_marketing_strip(image_bytes: bytes, tagline: str, placement: dict) -> b
     return buf.getvalue()
 
 
+def generate_minimal_hebrew_from_image(client: anthropic.Anthropic, img_bytes: bytes) -> str:
+    """Generate minimalistic Hebrew marketing copy from a single product image."""
+    img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+    if max(img.size) > 1200:
+        ratio = 1200 / max(img.size)
+        img = img.resize((int(img.width * ratio), int(img.height * ratio)), Image.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=85)
+    b64 = base64.standard_b64encode(buf.getvalue()).decode()
+
+    msg = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=800,
+        messages=[{
+            "role": "user",
+            "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}},
+                {"type": "text", "text": (
+                    "זו תמונה של מוצר חשמלי למטבח. "
+                    "כתוב תוכן שיווקי מינימליסטי בעברית לאתר איקומרס, בהתבסס רק על מה שאתה רואה בתמונה.\n\n"
+                    "המבנה:\n"
+                    "1. שורת כותרת ראשית: סוג המוצר + שם/מותג אם נראה בתמונה\n"
+                    "2. פסקה קצרה (3-4 משפטים) על מה המוצר עושה ויתרונותיו הנראים לעין\n"
+                    "3. 3-4 bullets על תכונות בולטות (חומרים, עיצוב, שימושיות)\n\n"
+                    "שמור על טון שיווקי מקצועי אך קצר ותמציתי. אל תמציא מפרט טכני שאתה לא רואה בתמונה. "
+                    "החזר רק את הטקסט השיווקי בעברית, בלי הסברים נוספים."
+                )},
+            ],
+        }],
+    )
+    return msg.content[0].text
+
+
 def create_zip(images: list[dict], hebrew_text: str, bg_removed: bool = False,
                atmospheres_clean: list[bytes] | None = None,
                atmospheres_striped: list[bytes] | None = None) -> bytes:
@@ -481,8 +549,18 @@ col1, col2 = st.columns([1, 1], gap="large")
 
 with col1:
     st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.markdown('<div class="section-title"><span class="step-badge">1</span> העלאת PDF</div>', unsafe_allow_html=True)
-    uploaded = st.file_uploader("גרור PDF של אריזת מוצר", type=["pdf"], label_visibility="collapsed")
+    st.markdown('<div class="section-title"><span class="step-badge">1</span> העלאת קובץ</div>', unsafe_allow_html=True)
+
+    upload_mode = st.radio(
+        "סוג קלט",
+        options=["PDF של אריזה", "תמונת מוצר בודדת"],
+        horizontal=True,
+    )
+
+    if upload_mode == "PDF של אריזה":
+        uploaded = st.file_uploader("גרור PDF של אריזת מוצר", type=["pdf"], label_visibility="collapsed", key="pdf_upl")
+    else:
+        uploaded = st.file_uploader("גרור תמונת מוצר (JPG/PNG)", type=["jpg", "jpeg", "png", "webp"], label_visibility="collapsed", key="img_upl")
 
     if uploaded:
         st.success(f"✅ {uploaded.name} ({uploaded.size // 1024} KB)")
@@ -493,13 +571,16 @@ with col1:
             options=["900x900", "גודל מקסימלי"],
             horizontal=True,
         )
-        remove_bg = st.checkbox("הסרת רקע (רקע שקוף)")
+        if upload_mode == "PDF של אריזה":
+            remove_bg = st.checkbox("הסרת רקע (רקע שקוף)")
+        else:
+            remove_bg = False
         gen_atmospheres = st.checkbox("ייצר תמונות אווירה (4 נקיות + 4 עם פס שיווקי) (~$0.16 לקובץ)")
 
-        run_btn = st.button("🚀 עבד את האריזה", use_container_width=True)
+        run_btn = st.button("🚀 עבד", use_container_width=True)
     else:
         run_btn = False
-        st.info("📂 ממתין לקובץ PDF...")
+        st.info("📂 ממתין לקובץ...")
     st.markdown('</div>', unsafe_allow_html=True)
 
 # ── Process ──
@@ -509,21 +590,111 @@ if run_btn and uploaded:
         st.stop()
 
     client = anthropic.Anthropic(api_key=api_key)
-    pdf_bytes = uploaded.read()
+    file_bytes = uploaded.read()
 
     try:
+     if upload_mode == "תמונת מוצר בודדת":
+        # === SINGLE IMAGE MODE ===
+        with col1:
+            with st.status("מעבד תמונה...", expanded=True) as status:
+                target_size = 900 if image_size == "900x900" else None
+                resized = resize_to_square(file_bytes, target_size)
+                pil = Image.open(io.BytesIO(resized))
+                images = [{"bytes": resized, "width": pil.width, "height": pil.height, "xref": 0}]
+                status.update(label="תמונה עובדה", state="complete")
+
+            with st.status("מייצר תוכן שיווקי מינימליסטי בעברית...", expanded=True) as status:
+                hebrew_content = generate_minimal_hebrew_from_image(client, resized)
+                status.update(label="תוכן שיווקי מוכן!", state="complete")
+
+            packaging_text = ""
+            num_pages = 0
+            bg_removed = False
+
+            # Atmosphere images
+            atmospheres_clean = []
+            atmospheres_striped = []
+            if gen_atmospheres:
+                if not gemini_key:
+                    st.warning("צריך Gemini API Key כדי לייצר תמונות אווירה")
+                else:
+                    try:
+                        from google import genai as google_genai
+                        gemini_client = google_genai.Client(api_key=gemini_key)
+                        ref_img = Image.open(io.BytesIO(resized))
+                        ref_buf = io.BytesIO()
+                        ref_img.convert("RGB").save(ref_buf, format="JPEG", quality=92)
+                        ref_bytes = ref_buf.getvalue()
+
+                        with st.status("יוצר תיאורי סצנה...", expanded=True) as status:
+                            scene_prompts = generate_scene_prompts(client, "", hebrew_content)
+                            status.update(label="תיאורי סצנה מוכנים", state="complete")
+
+                        atmosphere_errors = []
+                        with st.status("מייצר תמונות אווירה...", expanded=True) as status:
+                            for i, sp in enumerate(scene_prompts):
+                                status.update(label=f"מייצר תמונת אווירה {i+1}/{len(scene_prompts)}...")
+                                try:
+                                    atm = generate_atmosphere_image(gemini_client, ref_bytes, sp)
+                                    atmospheres_clean.append(atm)
+                                except Exception as e:
+                                    atmosphere_errors.append(f"תמונה {i+1}: {type(e).__name__}: {e}")
+                            status.update(label=f"נוצרו {len(atmospheres_clean)} תמונות אווירה", state="complete")
+                        for err in atmosphere_errors:
+                            st.error(err)
+
+                        if atmospheres_clean:
+                            with st.status("מחלץ משפטי שיווק...", expanded=True) as status:
+                                taglines = extract_marketing_taglines(client, hebrew_content)
+                                status.update(label="משפטי שיווק מוכנים", state="complete")
+
+                            with st.status("מוסיף פסי שיווק...", expanded=True) as status:
+                                for i, atm in enumerate(atmospheres_clean):
+                                    status.update(label=f"מעצב פס שיווקי {i+1}/{len(atmospheres_clean)}...")
+                                    placement = analyze_strip_placement(client, atm)
+                                    tagline = taglines[i] if i < len(taglines) else taglines[0]
+                                    striped = draw_marketing_strip(atm, tagline, placement)
+                                    atmospheres_striped.append(striped)
+                                status.update(label="פסי שיווק מוכנים!", state="complete")
+                    except Exception as e:
+                        st.warning(f"כשל בייצור תמונות אווירה: {e}")
+
+        st.session_state["results"] = {
+            "images": images,
+            "packaging_text": packaging_text,
+            "hebrew_content": hebrew_content,
+            "filename": uploaded.name,
+            "bg_removed": bg_removed,
+            "atmospheres_clean": atmospheres_clean,
+            "atmospheres_striped": atmospheres_striped,
+        }
+
+     else:
+        # === PDF MODE (original flow) ===
+        pdf_bytes = file_bytes
         with col1:
             # Step 1 – Extract images
             with st.status("שולף תמונות מה-PDF...", expanded=True) as status:
-                images = extract_images_from_pdf(pdf_bytes)
+                raw_images = extract_images_from_pdf(pdf_bytes)
+                status.update(label=f"נמצאו {len(raw_images)} תמונות, מסנן...")
+
+                # Filter out non-product images using Claude Vision (PSD mockups, diagrams, etc.)
+                images = []
+                for i, img in enumerate(raw_images):
+                    status.update(label=f"מסנן תמונות ({i+1}/{len(raw_images)})...")
+                    try:
+                        if is_product_image(client, img["bytes"]):
+                            images.append(img)
+                    except Exception:
+                        images.append(img)  # On filter error, keep the image
+
                 # Apply resize
                 target_size = 900 if image_size == "900x900" else None
                 for img in images:
                     img["bytes"] = resize_to_square(img["bytes"], target_size)
-                    # Update dimensions
                     pil = Image.open(io.BytesIO(img["bytes"]))
                     img["width"], img["height"] = pil.width, pil.height
-                status.update(label=f"נמצאו {len(images)} תמונות מוצר", state="complete")
+                status.update(label=f"{len(images)} תמונות מוצר איכותיות (סוננו {len(raw_images)-len(images)})", state="complete")
 
             # Step 1.5 – Remove background if requested
             bg_removed = False
