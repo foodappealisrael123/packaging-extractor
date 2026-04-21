@@ -294,18 +294,94 @@ def is_product_image(client: anthropic.Anthropic, img_bytes: bytes) -> bool:
 
 
 PRODUCT_PRESERVATION_RULES = (
-    " CRITICAL PRODUCT INTEGRITY RULES (must appear in every prompt): "
-    "Show the product EXACTLY as it appears in the reference photos - same shape, same color, "
-    "same number of pieces, same handles, same lid, same proportions. "
-    "DO NOT add, remove, or modify any element of the product itself. "
-    "DO NOT invent extra handles, pots, pans, buttons, parts, or accessories that are not in the reference. "
-    "DO NOT change the product's material, finish, or dimensions. "
-    "Your job is ONLY to change the SCENE AROUND the product (background, lighting, food, styling) - "
-    "the product itself must be a perfect visual match to the reference."
+    "ABSOLUTE PRODUCT INTEGRITY RULES (most important - do not violate): "
+    "The product in your output image MUST be a perfect pixel-accurate match to the reference photos. "
+    "Same exact shape, same exact color, same exact number of pieces, same handles, same lid, same proportions, "
+    "same material finish, same surface details, same branding/logos. "
+    "DO NOT add, remove, replace, or modify any element of the product itself - not even slightly. "
+    "DO NOT invent extra handles, parts, accessories, or components that are not visible in the references. "
+    "DO NOT swap the product for a generic look-alike from your training data. "
+    "Treat the reference photos as a template that must be reproduced exactly. "
+    "Your ONLY creative freedom is in the SCENE AROUND the product (background, lighting, props, food styling)."
+)
+
+# Intentionally minimal - we let Gemini choose the scene freely to maximize product fidelity.
+# The preservation rules appear FIRST in the final prompt (they get higher attention weight).
+MINIMAL_ATMOSPHERE_PROMPT = (
+    "Create a beautiful professional lifestyle product photograph of the item shown in the reference images. "
+    "You decide the scene, lighting, and composition - whatever makes the product look its most appealing "
+    "in a natural setting suitable for a premium e-commerce website."
 )
 
 
-def generate_feature_scenes(client: anthropic.Anthropic, packaging_text: str, hebrew_content: str) -> list[dict]:
+def analyze_image_for_strip(client: anthropic.Anthropic, image_bytes: bytes, hebrew_content: str, used_taglines: list[str]) -> dict:
+    """Ask Claude Vision to (1) pick a Hebrew tagline matching what's ACTUALLY VISIBLE in the image,
+    (2) choose strip position/color/text color. Called AFTER atmosphere generation."""
+    b64 = base64.standard_b64encode(image_bytes).decode()
+    used_str = ", ".join(f'"{t}"' for t in used_taglines) if used_taglines else "(none yet)"
+    prompt = f"""You are designing a marketing banner for an e-commerce product image.
+
+This is a lifestyle photograph of a kitchen product. Your job is to pick a Hebrew marketing tagline that matches what is ACTUALLY VISIBLE in this specific image, and decide strip styling.
+
+Hebrew marketing copy (brand voice + available features to draw from):
+---
+{hebrew_content}
+---
+
+Taglines already used for other images in this campaign (DO NOT repeat - each image must have a unique message):
+{used_str}
+
+Tasks:
+
+1. **TAGLINE (Hebrew, 3-6 words)**: Pick a punchy Hebrew marketing phrase that:
+   - Describes a feature or benefit VISIBLE in this specific image (not something invisible).
+   - Is supported by the marketing copy above.
+   - Is different from the already-used taglines.
+   - Sounds like a real premium product ad.
+   - If no specific feature is obvious, use a strong general tagline like "עיצוב ללא פשרות", "איכות יוצאת דופן", "מצטיין בכל מטבח" - something that always fits.
+
+2. **STRIP PLACEMENT**:
+   - Product in UPPER half → strip at BOTTOM. Product in LOWER half → strip at TOP. Centered → prefer BOTTOM.
+
+3. **COLORS**:
+   - strip_color: harmonizes with or boldly contrasts the image (deep red, dark navy, forest green, warm black, or product's brand color).
+   - text_color: white on dark strips, dark on light strips - must be highly readable.
+
+4. **SIZE**: strip_height_ratio between 0.10 and 0.14.
+
+Respond with ONLY valid JSON, nothing else. The tagline value MUST be in Hebrew:
+{{"tagline": "המשפט בעברית", "strip_position": "top" or "bottom", "strip_color": "#RRGGBB", "text_color": "#RRGGBB", "strip_height_ratio": 0.12}}"""
+
+    msg = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=500,
+        messages=[{
+            "role": "user",
+            "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}},
+                {"type": "text", "text": prompt},
+            ],
+        }],
+    )
+    text = msg.content[0].text.strip()
+    if text.startswith("```"):
+        text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+        if text.startswith("json"):
+            text = text[4:].strip()
+    try:
+        data = json.loads(text)
+        return {
+            "tagline": data.get("tagline", "איכות יוצאת דופן"),
+            "strip_position": data.get("strip_position", "bottom"),
+            "strip_color": data.get("strip_color", "#8B0000"),
+            "text_color": data.get("text_color", "#FFFFFF"),
+            "strip_height_ratio": float(data.get("strip_height_ratio", 0.12)),
+        }
+    except Exception:
+        return {"tagline": "איכות יוצאת דופן", "strip_position": "bottom", "strip_color": "#8B0000", "text_color": "#FFFFFF", "strip_height_ratio": 0.12}
+
+
+def _unused_generate_feature_scenes(client: anthropic.Anthropic, packaging_text: str, hebrew_content: str) -> list[dict]:
     """Return 4 {tagline, scene_prompt} pairs - features-first design.
     Each tagline is a key product strength in Hebrew, and each scene_prompt tells
     Gemini to VISUALIZE that specific strength, guaranteeing text-image alignment."""
@@ -404,20 +480,20 @@ def extract_marketing_taglines(client: anthropic.Anthropic, hebrew_content: str)
     return json.loads(text)
 
 
-def generate_atmosphere_image(gemini_client, product_img_bytes_list: list[bytes], prompt: str) -> bytes:
-    """Generate a lifestyle image using Gemini 2.5 Flash Image, with multiple reference images."""
+def generate_atmosphere_image(gemini_client, product_img_bytes_list: list[bytes], prompt: str = MINIMAL_ATMOSPHERE_PROMPT) -> bytes:
+    """Generate a lifestyle image using Gemini 2.5 Flash Image, with multiple reference images.
+    Preservation rules are prepended (not appended) to get higher attention weight."""
     from google.genai import types as gen_types
     product_imgs = [Image.open(io.BytesIO(b)) for b in product_img_bytes_list]
-    # Safety belt: ensure preservation rules are in the prompt even if Claude omitted them
-    if "PRODUCT INTEGRITY" not in prompt:
-        prompt = prompt.rstrip() + " " + PRODUCT_PRESERVATION_RULES
+    # Put preservation rules FIRST (higher attention), then the scene prompt
+    full_prompt = PRODUCT_PRESERVATION_RULES + "\n\n" + prompt
     config = gen_types.GenerateContentConfig(response_modalities=["TEXT", "IMAGE"])
     last_err = None
     for model_name in ("gemini-2.5-flash-image", "gemini-2.5-flash-image-preview"):
         try:
             response = gemini_client.models.generate_content(
                 model=model_name,
-                contents=[prompt, *product_imgs],
+                contents=[full_prompt, *product_imgs],
                 config=config,
             )
             parts = response.candidates[0].content.parts if response.candidates else []
@@ -745,31 +821,27 @@ if run_btn and uploaded:
                             ref_pil.save(rb, format="JPEG", quality=92)
                             ref_bytes_list.append(rb.getvalue())
 
-                        with st.status(f"מזהה 4 חוזקות מוצר ומעצב סצנות תואמות (עם {len(ref_bytes_list)} תמונות רפרנס)...", expanded=True) as status:
-                            feature_scenes = generate_feature_scenes(client, "", hebrew_content)
-                            status.update(label=f"נבחרו {len(feature_scenes)} חוזקות", state="complete")
-
-                        atmosphere_pairs = []  # list of (tagline, atmosphere_bytes)
                         atmosphere_errors = []
-                        with st.status("מייצר תמונות אווירה שמציגות את החוזקות...", expanded=True) as status:
-                            for i, fs in enumerate(feature_scenes):
-                                status.update(label=f"מייצר תמונה {i+1}/{len(feature_scenes)}: {fs['tagline']}")
+                        with st.status(f"מייצר תמונות אווירה (Gemini בוחר חופשי, עם {len(ref_bytes_list)} תמונות רפרנס)...", expanded=True) as status:
+                            for i in range(4):
+                                status.update(label=f"מייצר תמונה {i+1}/4 - דיוק מוצר מקסימלי...")
                                 try:
-                                    atm = generate_atmosphere_image(gemini_client, ref_bytes_list, fs["scene_prompt"])
+                                    atm = generate_atmosphere_image(gemini_client, ref_bytes_list)
                                     atmospheres_clean.append(atm)
-                                    atmosphere_pairs.append((fs["tagline"], atm))
                                 except Exception as e:
-                                    atmosphere_errors.append(f"תמונה {i+1} ('{fs['tagline']}'): {type(e).__name__}: {e}")
+                                    atmosphere_errors.append(f"תמונה {i+1}: {type(e).__name__}: {e}")
                             status.update(label=f"נוצרו {len(atmospheres_clean)} תמונות אווירה", state="complete")
                         for err in atmosphere_errors:
                             st.error(err)
 
-                        if atmosphere_pairs:
-                            with st.status("מוסיף פסי שיווק...", expanded=True) as status:
-                                for i, (tagline, atm) in enumerate(atmosphere_pairs):
-                                    status.update(label=f"מעצב פס {i+1}/{len(atmosphere_pairs)}: {tagline}")
-                                    placement = analyze_strip_placement(client, atm)
-                                    striped = draw_marketing_strip(atm, tagline, placement)
+                        if atmospheres_clean:
+                            with st.status("מנתח תמונות ומתאים משפטי שיווק...", expanded=True) as status:
+                                used_taglines = []
+                                for i, atm in enumerate(atmospheres_clean):
+                                    status.update(label=f"מתאים טקסט לתמונה {i+1}/{len(atmospheres_clean)}...")
+                                    placement = analyze_image_for_strip(client, atm, hebrew_content, used_taglines)
+                                    used_taglines.append(placement["tagline"])
+                                    striped = draw_marketing_strip(atm, placement["tagline"], placement)
                                     atmospheres_striped.append(striped)
                                 status.update(label="פסי שיווק מוכנים!", state="complete")
                     except Exception as e:
@@ -857,31 +929,27 @@ if run_btn and uploaded:
                             ref_pil.save(rb, format="JPEG", quality=92)
                             ref_bytes_list.append(rb.getvalue())
 
-                        with st.status("מזהה 4 חוזקות מוצר ומעצב סצנות תואמות...", expanded=True) as status:
-                            feature_scenes = generate_feature_scenes(client, packaging_text, hebrew_content)
-                            status.update(label=f"נבחרו {len(feature_scenes)} חוזקות", state="complete")
-
-                        atmosphere_pairs = []  # list of (tagline, atmosphere_bytes)
                         atmosphere_errors = []
-                        with st.status(f"מייצר תמונות אווירה שמציגות את החוזקות (עם {len(ref_bytes_list)} תמונות רפרנס)...", expanded=True) as status:
-                            for i, fs in enumerate(feature_scenes):
-                                status.update(label=f"מייצר תמונה {i+1}/{len(feature_scenes)}: {fs['tagline']}")
+                        with st.status(f"מייצר תמונות אווירה (Gemini בוחר חופשי, עם {len(ref_bytes_list)} תמונות רפרנס)...", expanded=True) as status:
+                            for i in range(4):
+                                status.update(label=f"מייצר תמונה {i+1}/4 - דיוק מוצר מקסימלי...")
                                 try:
-                                    atm = generate_atmosphere_image(gemini_client, ref_bytes_list, fs["scene_prompt"])
+                                    atm = generate_atmosphere_image(gemini_client, ref_bytes_list)
                                     atmospheres_clean.append(atm)
-                                    atmosphere_pairs.append((fs["tagline"], atm))
                                 except Exception as e:
-                                    atmosphere_errors.append(f"תמונה {i+1} ('{fs['tagline']}'): {type(e).__name__}: {e}")
+                                    atmosphere_errors.append(f"תמונה {i+1}: {type(e).__name__}: {e}")
                             status.update(label=f"נוצרו {len(atmospheres_clean)} תמונות אווירה", state="complete")
                         for err in atmosphere_errors:
                             st.error(err)
 
-                        if atmosphere_pairs:
-                            with st.status("מוסיף פסי שיווק...", expanded=True) as status:
-                                for i, (tagline, atm) in enumerate(atmosphere_pairs):
-                                    status.update(label=f"מעצב פס {i+1}/{len(atmosphere_pairs)}: {tagline}")
-                                    placement = analyze_strip_placement(client, atm)
-                                    striped = draw_marketing_strip(atm, tagline, placement)
+                        if atmospheres_clean:
+                            with st.status("מנתח תמונות ומתאים משפטי שיווק...", expanded=True) as status:
+                                used_taglines = []
+                                for i, atm in enumerate(atmospheres_clean):
+                                    status.update(label=f"מתאים טקסט לתמונה {i+1}/{len(atmospheres_clean)}...")
+                                    placement = analyze_image_for_strip(client, atm, hebrew_content, used_taglines)
+                                    used_taglines.append(placement["tagline"])
+                                    striped = draw_marketing_strip(atm, placement["tagline"], placement)
                                     atmospheres_striped.append(striped)
                                 status.update(label="פסי שיווק מוכנים!", state="complete")
                     except Exception as e:
