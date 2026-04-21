@@ -2,13 +2,22 @@ import streamlit as st
 import anthropic
 import base64
 import os
+import json
 import zipfile
 from pathlib import Path
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 import fitz  # PyMuPDF
 import subprocess
 import tempfile
 import io
+
+FONT_PATH = str(Path(__file__).parent / "assets" / "fonts" / "Heebo-Bold.ttf")
+
+
+def _load_font(size: int) -> ImageFont.FreeTypeFont:
+    """Load the Heebo font as bytes (works with non-ASCII paths)."""
+    with open(FONT_PATH, "rb") as f:
+        return ImageFont.truetype(io.BytesIO(f.read()), size)
 
 # ─────────────────────────────────────────
 #  Page config
@@ -233,7 +242,178 @@ def remove_background(img_bytes: bytes) -> bytes:
     return result
 
 
-def create_zip(images: list[dict], hebrew_text: str, bg_removed: bool = False) -> bytes:
+def generate_scene_prompts(client: anthropic.Anthropic, packaging_text: str, hebrew_content: str) -> list[str]:
+    """Use Claude to generate 4 English scene prompts for Gemini image generation."""
+    prompt = f"""You are a creative director for product photography. A Food Appeal kitchen appliance needs 4 lifestyle images.
+
+Product info (English text from packaging):
+{packaging_text}
+
+Hebrew marketing copy:
+{hebrew_content}
+
+Generate 4 detailed English prompts for AI image generation. Each prompt will be combined with a reference product photo to create a lifestyle image:
+- Prompt 1 & 2: The product IN USE with relevant food inside/on it (e.g., for slow cooker → stew inside; for waffle maker → fresh waffles). Choose FOODS THAT MAKE SENSE for this specific appliance.
+- Prompt 3 & 4: The product in a BEAUTIFUL KITCHEN SCENE (on a counter, styled with plates/ingredients nearby, natural light, modern home).
+
+Each prompt should:
+- Describe lighting (warm morning light, soft overhead, etc.)
+- Describe composition (close-up, 3/4 angle, etc.)
+- Describe styling (herbs, ingredients, plates)
+- Mention the product should remain identical to the reference
+- Be 2-3 sentences, photography-style
+
+Respond with ONLY a valid JSON array of 4 strings, nothing else:
+["prompt 1", "prompt 2", "prompt 3", "prompt 4"]"""
+
+    msg = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=1500,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    text = msg.content[0].text.strip()
+    # Strip markdown code fence if present
+    if text.startswith("```"):
+        text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+        if text.startswith("json"):
+            text = text[4:].strip()
+    return json.loads(text)
+
+
+def extract_marketing_taglines(client: anthropic.Anthropic, hebrew_content: str) -> list[str]:
+    """Use Claude to extract 4 short Hebrew marketing taglines."""
+    prompt = f"""מתוך הטקסט השיווקי הבא, חלץ 4 משפטי שיווק קצרים וקליטים (3-6 מילים כל אחד) שיתאימו להצגה כפס שיווקי על תמונת מוצר.
+
+כל משפט צריך:
+- להיות קצר ומרשים
+- להדגיש תכונה/יתרון מרכזי
+- להיות שונה מהשאר
+
+טקסט שיווקי:
+{hebrew_content}
+
+החזר רק JSON array של 4 מחרוזות בעברית, בלי שום הסבר נוסף:
+["משפט 1", "משפט 2", "משפט 3", "משפט 4"]"""
+
+    msg = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=500,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    text = msg.content[0].text.strip()
+    if text.startswith("```"):
+        text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+        if text.startswith("json"):
+            text = text[4:].strip()
+    return json.loads(text)
+
+
+def generate_atmosphere_image(gemini_client, product_img_bytes: bytes, prompt: str) -> bytes:
+    """Generate a lifestyle image using Gemini 2.5 Flash Image."""
+    product_img = Image.open(io.BytesIO(product_img_bytes))
+    response = gemini_client.models.generate_content(
+        model="gemini-2.5-flash-image",
+        contents=[prompt, product_img],
+    )
+    for part in response.parts:
+        if part.inline_data is not None:
+            raw = part.inline_data.data
+            # Normalize to 900x900 square
+            img = Image.open(io.BytesIO(raw))
+            side = min(img.width, img.height)
+            left = (img.width - side) // 2
+            top = (img.height - side) // 2
+            img = img.crop((left, top, left + side, top + side))
+            if img.width != 900:
+                img = img.resize((900, 900), Image.LANCZOS)
+            buf = io.BytesIO()
+            img.convert("RGB").save(buf, format="JPEG", quality=92)
+            return buf.getvalue()
+    raise RuntimeError("Gemini returned no image: " + (response.text or ""))
+
+
+def analyze_strip_placement(client: anthropic.Anthropic, image_bytes: bytes) -> dict:
+    """Ask Claude Vision to choose strip position, color, and text color for an image."""
+    b64 = base64.standard_b64encode(image_bytes).decode()
+    prompt = """Analyze this product lifestyle image and decide where to place a marketing text strip.
+
+Rules:
+- If the main product is in the UPPER half, place the strip at the BOTTOM. If in the LOWER half, place at the TOP. If centered, prefer BOTTOM.
+- Pick a strip_color that harmonizes with (or boldly contrasts) the dominant image colors, similar to how premium product ads look. Deep reds, dark navy, forest green, or warm black usually work well.
+- text_color must be highly readable on the strip (white on dark strips, dark on light strips).
+- strip_height_ratio should be 0.10-0.14.
+
+Respond with ONLY valid JSON, nothing else:
+{"strip_position": "top" or "bottom", "strip_color": "#RRGGBB", "text_color": "#RRGGBB", "strip_height_ratio": 0.12}"""
+
+    msg = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=300,
+        messages=[{
+            "role": "user",
+            "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}},
+                {"type": "text", "text": prompt},
+            ],
+        }],
+    )
+    text = msg.content[0].text.strip()
+    if text.startswith("```"):
+        text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+        if text.startswith("json"):
+            text = text[4:].strip()
+    try:
+        data = json.loads(text)
+        return {
+            "strip_position": data.get("strip_position", "bottom"),
+            "strip_color": data.get("strip_color", "#8B0000"),
+            "text_color": data.get("text_color", "#FFFFFF"),
+            "strip_height_ratio": float(data.get("strip_height_ratio", 0.12)),
+        }
+    except Exception:
+        # Safe default
+        return {"strip_position": "bottom", "strip_color": "#8B0000", "text_color": "#FFFFFF", "strip_height_ratio": 0.12}
+
+
+def draw_marketing_strip(image_bytes: bytes, tagline: str, placement: dict) -> bytes:
+    """Draw a colored strip with Hebrew tagline on top/bottom of the image."""
+    from bidi.algorithm import get_display
+
+    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    W, H = img.size
+    strip_h = int(H * placement["strip_height_ratio"])
+    pos = placement["strip_position"]
+
+    draw = ImageDraw.Draw(img)
+    if pos == "top":
+        strip_box = (0, 0, W, strip_h)
+    else:
+        strip_box = (0, H - strip_h, W, H)
+    draw.rectangle(strip_box, fill=placement["strip_color"])
+
+    # Hebrew text: reorder for RTL
+    display_text = get_display(tagline)
+    font_size = int(strip_h * 0.55)
+    font = _load_font(font_size)
+
+    l, t, r, b = draw.textbbox((0, 0), display_text, font=font)
+    tw, th = r - l, b - t
+    x = (W - tw) // 2 - l
+    if pos == "top":
+        y = (strip_h - th) // 2 - t
+    else:
+        y = (H - strip_h) + (strip_h - th) // 2 - t
+
+    draw.text((x, y), display_text, font=font, fill=placement["text_color"])
+
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=92)
+    return buf.getvalue()
+
+
+def create_zip(images: list[dict], hebrew_text: str, bg_removed: bool = False,
+               atmospheres_clean: list[bytes] | None = None,
+               atmospheres_striped: list[bytes] | None = None) -> bytes:
     """Pack images + text file into a ZIP."""
     ext = "png" if bg_removed else "jpg"
     buf = io.BytesIO()
@@ -241,6 +421,12 @@ def create_zip(images: list[dict], hebrew_text: str, bg_removed: bool = False) -
         zf.writestr("marketing_content_he.txt", hebrew_text.encode("utf-8"))
         for i, img in enumerate(images):
             zf.writestr(f"product_image_{i+1}.{ext}", img["bytes"])
+        if atmospheres_clean:
+            for i, b in enumerate(atmospheres_clean):
+                zf.writestr(f"atmosphere_clean_{i+1}.jpg", b)
+        if atmospheres_striped:
+            for i, b in enumerate(atmospheres_striped):
+                zf.writestr(f"atmosphere_marketing_{i+1}.jpg", b)
     buf.seek(0)
     return buf.read()
 
@@ -255,11 +441,23 @@ st.markdown("העלה PDF של אריזת מוצר וקבל תמונות נקי�
 # ── API Key ──
 with st.sidebar:
     st.markdown("### ⚙️ הגדרות")
-    default_key = st.secrets.get("ANTHROPIC_API_KEY", "")
+    def _safe_secret(key: str) -> str:
+        try:
+            return st.secrets.get(key, "")
+        except Exception:
+            return ""
+
+    default_key = _safe_secret("ANTHROPIC_API_KEY")
     if default_key:
         api_key = default_key
     else:
         api_key = st.text_input("Anthropic API Key", type="password", placeholder="sk-ant-...")
+
+    default_gemini = _safe_secret("GEMINI_API_KEY")
+    if default_gemini:
+        gemini_key = default_gemini
+    else:
+        gemini_key = st.text_input("Gemini API Key (אופציונלי)", type="password", placeholder="AIza...")
     st.markdown("---")
     st.markdown("**מה האפליקציה עושה:**")
     st.markdown("""
@@ -287,6 +485,7 @@ with col1:
             horizontal=True,
         )
         remove_bg = st.checkbox("הסרת רקע (רקע שקוף)")
+        gen_atmospheres = st.checkbox("ייצר 4 תמונות אווירה שיווקיות (~$0.16 לקובץ)")
 
         run_btn = st.button("🚀 עבד את האריזה", use_container_width=True)
     else:
@@ -341,6 +540,55 @@ if run_btn and uploaded:
                 hebrew_content = generate_hebrew_content(client, packaging_text)
                 status.update(label="תוכן שיווקי מוכן!", state="complete")
 
+            # Step 4 – Atmosphere images + marketing strips (optional)
+            atmospheres_clean = []
+            atmospheres_striped = []
+            if gen_atmospheres:
+                if not gemini_key:
+                    st.warning("צריך Gemini API Key כדי לייצר תמונות אווירה - דילגנו על השלב")
+                elif not images:
+                    st.warning("לא נמצאו תמונות מוצר ב-PDF, אי אפשר לייצר אווירה - דילגנו")
+                else:
+                    try:
+                        from google import genai as google_genai
+                        gemini_client = google_genai.Client(api_key=gemini_key)
+                        # Use the largest product image (first in the sorted list)
+                        # Must be original (not bg-removed PNG) - use JPEG-encoded version
+                        ref_img = Image.open(io.BytesIO(images[0]["bytes"]))
+                        ref_buf = io.BytesIO()
+                        ref_img.convert("RGB").save(ref_buf, format="JPEG", quality=92)
+                        ref_bytes = ref_buf.getvalue()
+
+                        with st.status("יוצר תיאורי סצנה...", expanded=True) as status:
+                            scene_prompts = generate_scene_prompts(client, packaging_text, hebrew_content)
+                            status.update(label="תיאורי סצנה מוכנים", state="complete")
+
+                        with st.status("מייצר תמונות אווירה...", expanded=True) as status:
+                            for i, sp in enumerate(scene_prompts):
+                                status.update(label=f"מייצר תמונת אווירה {i+1}/{len(scene_prompts)}...")
+                                try:
+                                    atm = generate_atmosphere_image(gemini_client, ref_bytes, sp)
+                                    atmospheres_clean.append(atm)
+                                except Exception as e:
+                                    st.warning(f"כשל ביצירת תמונה {i+1}: {e}")
+                            status.update(label=f"נוצרו {len(atmospheres_clean)} תמונות אווירה", state="complete")
+
+                        if atmospheres_clean:
+                            with st.status("מחלץ משפטי שיווק...", expanded=True) as status:
+                                taglines = extract_marketing_taglines(client, hebrew_content)
+                                status.update(label="משפטי שיווק מוכנים", state="complete")
+
+                            with st.status("מוסיף פסי שיווק...", expanded=True) as status:
+                                for i, atm in enumerate(atmospheres_clean):
+                                    status.update(label=f"מעצב פס שיווקי {i+1}/{len(atmospheres_clean)}...")
+                                    placement = analyze_strip_placement(client, atm)
+                                    tagline = taglines[i] if i < len(taglines) else taglines[0]
+                                    striped = draw_marketing_strip(atm, tagline, placement)
+                                    atmospheres_striped.append(striped)
+                                status.update(label="פסי שיווק מוכנים!", state="complete")
+                    except Exception as e:
+                        st.warning(f"כשל בייצור תמונות אווירה: {e}")
+
         # Save to session state so results survive reruns
         st.session_state["results"] = {
             "images": images,
@@ -348,6 +596,8 @@ if run_btn and uploaded:
             "hebrew_content": hebrew_content,
             "filename": uploaded.name,
             "bg_removed": bg_removed,
+            "atmospheres_clean": atmospheres_clean,
+            "atmospheres_striped": atmospheres_striped,
         }
 
     except anthropic.AuthenticationError:
@@ -368,6 +618,8 @@ if results:
     hebrew_content = results["hebrew_content"]
     filename = results["filename"]
     bg_removed = results.get("bg_removed", False)
+    atmospheres_clean = results.get("atmospheres_clean", [])
+    atmospheres_striped = results.get("atmospheres_striped", [])
 
     with col2:
         st.markdown('<div class="card">', unsafe_allow_html=True)
@@ -393,10 +645,29 @@ if results:
         st.code(hebrew_content, language=None)
         st.markdown('</div>', unsafe_allow_html=True)
 
+        # ── Atmosphere images ──
+        if atmospheres_clean:
+            st.markdown('<div class="card">', unsafe_allow_html=True)
+            st.markdown('<div class="section-title"><span class="step-badge">4</span> תמונות אווירה שיווקיות</div>', unsafe_allow_html=True)
+
+            st.markdown("**תמונות אווירה נקיות:**")
+            atm_cols = st.columns(min(len(atmospheres_clean), 2))
+            for i, atm in enumerate(atmospheres_clean):
+                with atm_cols[i % 2]:
+                    st.image(Image.open(io.BytesIO(atm)), caption=f"אווירה {i+1}", use_container_width=True)
+
+            if atmospheres_striped:
+                st.markdown("**תמונות עם פס שיווקי:**")
+                str_cols = st.columns(min(len(atmospheres_striped), 2))
+                for i, atm in enumerate(atmospheres_striped):
+                    with str_cols[i % 2]:
+                        st.image(Image.open(io.BytesIO(atm)), caption=f"שיווקי {i+1}", use_container_width=True)
+            st.markdown('</div>', unsafe_allow_html=True)
+
         # ── Download ZIP ──
         st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown('<div class="section-title"><span class="step-badge">4</span> הורדה</div>', unsafe_allow_html=True)
-        zip_bytes = create_zip(images, hebrew_content, bg_removed)
+        st.markdown('<div class="section-title"><span class="step-badge">5</span> הורדה</div>', unsafe_allow_html=True)
+        zip_bytes = create_zip(images, hebrew_content, bg_removed, atmospheres_clean, atmospheres_striped)
         st.download_button(
             label="הורד ZIP (תמונות + תוכן עברי)",
             data=zip_bytes,
