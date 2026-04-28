@@ -548,28 +548,31 @@ def extract_marketing_taglines(client: anthropic.Anthropic, hebrew_content: str)
 def generate_atmosphere_image(
     gemini_client,
     product_img_bytes_list: list[bytes],
-    style_ref_bytes_list: list[bytes] | None = None,
+    scene_template_bytes: bytes | None = None,
     prompt: str = MINIMAL_ATMOSPHERE_PROMPT,
     user_notes: str = "",
 ) -> bytes:
     """Generate a lifestyle image using Gemini 2.5 Flash Image.
     product_img_bytes_list: the actual product photos - must be preserved pixel-accurate.
-    style_ref_bytes_list: OPTIONAL atmosphere/lifestyle reference images - style inspiration only.
+    scene_template_bytes: OPTIONAL single reference image used as a SCENE TEMPLATE.
+        When provided, Gemini reproduces the reference's scene/composition/lighting/angle
+        but swaps the product visible in it for our product.
     user_notes: optional user instructions/emphasis to steer the atmosphere."""
     from google.genai import types as gen_types
     product_imgs = [Image.open(io.BytesIO(b)) for b in product_img_bytes_list]
-    style_imgs = [Image.open(io.BytesIO(b)) for b in (style_ref_bytes_list or [])]
+    template_img = Image.open(io.BytesIO(scene_template_bytes)) if scene_template_bytes else None
 
-    # Build prompt with clear labels: which images to preserve vs which are style-only
-    if style_imgs:
+    if template_img is not None:
         full_prompt = (
             PRODUCT_PRESERVATION_RULES + "\n\n"
-            f"The first {len(product_imgs)} images show the EXACT PRODUCT - these must be preserved pixel-accurately in your output.\n\n"
-            f"The next {len(style_imgs)} images are ATMOSPHERE/STYLE REFERENCES for inspiration only. "
-            "Study their aesthetic, lighting, composition, mood, and styling - but DO NOT copy their scene, "
-            "DO NOT reproduce their exact composition, and DO NOT copy any text/banners/overlays from them. "
-            "Use them only to understand the visual direction. Create a UNIQUE new scene in that same visual direction.\n\n"
-            + prompt
+            f"The first {len(product_imgs)} images show the EXACT PRODUCT — preserve it pixel-accurately in your output.\n\n"
+            "The LAST image is a SCENE TEMPLATE. Reproduce its scene faithfully: same composition, "
+            "same camera angle and framing, same lighting style and direction, same setting/environment, "
+            "same overall mood and color palette. "
+            "Replace the product visible in the scene template with OUR product (from the first images), "
+            "keeping it in roughly the same position, scale, and orientation that the template's product had. "
+            "The original product from the template must NOT appear in the output — only OUR product. "
+            "Do NOT copy any text, captions, logos, watermarks, banners, or overlays from the scene template."
         )
     else:
         full_prompt = PRODUCT_PRESERVATION_RULES + "\n\n" + prompt
@@ -581,6 +584,10 @@ def generate_atmosphere_image(
         )
 
     config = gen_types.GenerateContentConfig(response_modalities=["TEXT", "IMAGE"])
+    contents = [full_prompt, *product_imgs]
+    if template_img is not None:
+        contents.append(template_img)
+
     last_err = None
     for model_name in (
         "gemini-2.5-flash-image",
@@ -589,7 +596,7 @@ def generate_atmosphere_image(
         try:
             response = gemini_client.models.generate_content(
                 model=model_name,
-                contents=[full_prompt, *product_imgs, *style_imgs],
+                contents=contents,
                 config=config,
             )
             parts = response.candidates[0].content.parts if response.candidates else []
@@ -872,24 +879,39 @@ with col1:
             ),
         )
 
-        gen_atmospheres = st.checkbox("ייצר תמונות אווירה (4 נקיות + 4 עם פס שיווקי) (~$0.16 לקובץ)")
+        gen_atmospheres = st.checkbox("ייצר תמונות אווירה (עד 4 נקיות + 4 עם פס שיווקי) (~$0.16 לקובץ)")
 
-        style_ref_files = None
+        scene_template_inputs = []
         if gen_atmospheres:
-            with st.expander("🎨 תמונות רפרנס לסגנון אווירה (אופציונלי)", expanded=False):
+            with st.expander("🎯 מצב 'תעשה לי כזה' — תמונות רפרנס כתבנית סצנה (אופציונלי)", expanded=False):
                 st.caption(
-                    "העלה 1-4 תמונות של אווירות שיווקיות שאתה אוהב (מוצרים דומים, מתחרים, מוד-בורד). "
-                    "האפליקציה תלמד מהסגנון שלהן ליצור תמונות באותו כיוון - בלי להעתיק את הסצנה או טקסטים מהרפרנסים."
+                    "אפשר להעלות עד 4 תמונות רפרנס. לכל תמונה תיוצר תמונת אווירה אחת שמשחזרת את הסצנה והקומפוזיציה שלה — "
+                    "אבל עם המוצר שלך במקום המוצר שברפרנס. אפשר גם לכתוב לכל תמונה משפט שיווקי משלך שיופיע על הפס. "
+                    "אם תשאיר את כל הסלוטים ריקים — ייוצרו 4 תמונות אווירה גנריות עם משפטי שיווק אוטומטיים, כמו קודם."
                 )
-                style_ref_files = st.file_uploader(
-                    "תמונות רפרנס לסגנון",
-                    type=["jpg", "jpeg", "png", "webp"],
-                    accept_multiple_files=True,
-                    label_visibility="collapsed",
-                    key="style_refs_upl",
-                )
-                if style_ref_files:
-                    st.success(f"{len(style_ref_files)} תמונות רפרנס ישמשו להשראת סגנון")
+                for i in range(4):
+                    st.markdown(f"**רפרנס {i+1}:**")
+                    rc1, rc2 = st.columns([1, 1])
+                    with rc1:
+                        ref_file = st.file_uploader(
+                            f"תמונת רפרנס {i+1}",
+                            type=["jpg", "jpeg", "png", "webp"],
+                            label_visibility="collapsed",
+                            key=f"scene_ref_{i}",
+                        )
+                    with rc2:
+                        ref_tagline = st.text_input(
+                            f"משפט שיווקי {i+1}",
+                            placeholder="משפט שיווקי לפס (אופציונלי)",
+                            key=f"scene_tag_{i}",
+                            label_visibility="collapsed",
+                        )
+                    scene_template_inputs.append((ref_file, ref_tagline))
+                n_uploaded = sum(1 for f, _ in scene_template_inputs if f is not None)
+                if n_uploaded:
+                    st.success(f"✅ {n_uploaded} רפרנסים יומרו ל-{n_uploaded} תמונות אווירה לפי הסצנות שלהן")
+                else:
+                    st.info("📋 לא הועלו רפרנסים — ייוצרו 4 תמונות אווירה גנריות")
 
         run_btn = st.button("🚀 עבד", use_container_width=True)
     else:
@@ -940,6 +962,7 @@ if run_btn and uploaded:
             # Atmosphere images
             atmospheres_clean = []
             atmospheres_striped = []
+            user_taglines_per_atm = []
             if gen_atmospheres:
                 if not gemini_key:
                     st.warning("צריך Gemini API Key כדי לייצר תמונות אווירה")
@@ -947,7 +970,6 @@ if run_btn and uploaded:
                     try:
                         from google import genai as google_genai
                         gemini_client = google_genai.Client(api_key=gemini_key)
-                        # Use up to 3 uploaded images as references
                         ref_bytes_list = []
                         for img in images[:3]:
                             ref_pil = Image.open(io.BytesIO(img["bytes"])).convert("RGB")
@@ -955,38 +977,60 @@ if run_btn and uploaded:
                             ref_pil.save(rb, format="JPEG", quality=92)
                             ref_bytes_list.append(rb.getvalue())
 
-                        # Optional style reference images (atmosphere inspiration only)
-                        style_ref_bytes = []
-                        if style_ref_files:
-                            for f in style_ref_files[:4]:
-                                sr_pil = Image.open(io.BytesIO(f.read())).convert("RGB")
-                                if max(sr_pil.size) > 1200:
-                                    ratio = 1200 / max(sr_pil.size)
-                                    sr_pil = sr_pil.resize((int(sr_pil.width * ratio), int(sr_pil.height * ratio)), Image.LANCZOS)
-                                sb = io.BytesIO()
-                                sr_pil.save(sb, format="JPEG", quality=85)
-                                style_ref_bytes.append(sb.getvalue())
+                        scene_templates = []
+                        for ref_file, ref_tagline in scene_template_inputs:
+                            if ref_file is None:
+                                continue
+                            sr_pil = Image.open(io.BytesIO(ref_file.read())).convert("RGB")
+                            if max(sr_pil.size) > 1200:
+                                ratio = 1200 / max(sr_pil.size)
+                                sr_pil = sr_pil.resize((int(sr_pil.width * ratio), int(sr_pil.height * ratio)), Image.LANCZOS)
+                            sb = io.BytesIO()
+                            sr_pil.save(sb, format="JPEG", quality=85)
+                            scene_templates.append({"img_bytes": sb.getvalue(), "tagline": (ref_tagline or "").strip()})
 
                         atmosphere_errors = []
-                        style_note = f" + {len(style_ref_bytes)} רפרנסי סגנון" if style_ref_bytes else ""
-                        with st.status(f"מייצר תמונות אווירה ({len(ref_bytes_list)} תמונות מוצר{style_note})...", expanded=True) as status:
-                            for i in range(4):
-                                status.update(label=f"מייצר תמונה {i+1}/4 - דיוק מוצר מקסימלי...")
-                                try:
-                                    atm = generate_atmosphere_image(gemini_client, ref_bytes_list, style_ref_bytes or None, user_notes=user_notes)
-                                    atmospheres_clean.append(atm)
-                                except Exception as e:
-                                    atmosphere_errors.append(f"תמונה {i+1}: {type(e).__name__}: {e}")
-                            status.update(label=f"נוצרו {len(atmospheres_clean)} תמונות אווירה", state="complete")
+                        if scene_templates:
+                            n = len(scene_templates)
+                            with st.status(f"מייצר {n} תמונות אווירה לפי תבניות סצנה...", expanded=True) as status:
+                                for i, tpl in enumerate(scene_templates):
+                                    status.update(label=f"מייצר תמונה {i+1}/{n} לפי תבנית סצנה {i+1}...")
+                                    try:
+                                        atm = generate_atmosphere_image(
+                                            gemini_client, ref_bytes_list,
+                                            scene_template_bytes=tpl["img_bytes"],
+                                            user_notes=user_notes,
+                                        )
+                                        atmospheres_clean.append(atm)
+                                        user_taglines_per_atm.append(tpl["tagline"])
+                                    except Exception as e:
+                                        atmosphere_errors.append(f"תמונה {i+1}: {type(e).__name__}: {e}")
+                                status.update(label=f"נוצרו {len(atmospheres_clean)} תמונות אווירה", state="complete")
+                        else:
+                            with st.status(f"מייצר תמונות אווירה ({len(ref_bytes_list)} תמונות מוצר)...", expanded=True) as status:
+                                for i in range(4):
+                                    status.update(label=f"מייצר תמונה {i+1}/4 - דיוק מוצר מקסימלי...")
+                                    try:
+                                        atm = generate_atmosphere_image(gemini_client, ref_bytes_list, user_notes=user_notes)
+                                        atmospheres_clean.append(atm)
+                                        user_taglines_per_atm.append("")
+                                    except Exception as e:
+                                        atmosphere_errors.append(f"תמונה {i+1}: {type(e).__name__}: {e}")
+                                status.update(label=f"נוצרו {len(atmospheres_clean)} תמונות אווירה", state="complete")
                         for err in atmosphere_errors:
                             st.error(err)
 
                         if atmospheres_clean:
-                            with st.status("מנתח תמונות ומתאים משפטי שיווק...", expanded=True) as status:
+                            with st.status("מתאים פסי שיווק...", expanded=True) as status:
                                 used_taglines = []
                                 for i, atm in enumerate(atmospheres_clean):
-                                    status.update(label=f"מתאים טקסט לתמונה {i+1}/{len(atmospheres_clean)}...")
-                                    placement = analyze_image_for_strip(client, atm, hebrew_content, used_taglines, user_notes=user_notes)
+                                    status.update(label=f"מתאים פס שיווקי לתמונה {i+1}/{len(atmospheres_clean)}...")
+                                    user_tag = user_taglines_per_atm[i] if i < len(user_taglines_per_atm) else ""
+                                    if user_tag:
+                                        placement = analyze_strip_placement(client, atm)
+                                        placement["tagline"] = user_tag
+                                    else:
+                                        placement = analyze_image_for_strip(client, atm, hebrew_content, used_taglines, user_notes=user_notes)
                                     used_taglines.append(placement["tagline"])
                                     striped = draw_marketing_strip(atm, placement["tagline"], placement)
                                     atmospheres_striped.append(striped)
@@ -1058,6 +1102,7 @@ if run_btn and uploaded:
             # Step 4 – Atmosphere images + marketing strips (optional)
             atmospheres_clean = []
             atmospheres_striped = []
+            user_taglines_per_atm = []
             if gen_atmospheres:
                 if not gemini_key:
                     st.warning("צריך Gemini API Key כדי לייצר תמונות אווירה - דילגנו על השלב")
@@ -1067,8 +1112,6 @@ if run_btn and uploaded:
                     try:
                         from google import genai as google_genai
                         gemini_client = google_genai.Client(api_key=gemini_key)
-                        # Use top-3 product images as references (they're already sorted by area
-                        # and filtered to clean product shots, so these are the best representatives)
                         ref_bytes_list = []
                         for img in images[:3]:
                             ref_pil = Image.open(io.BytesIO(img["bytes"])).convert("RGB")
@@ -1076,38 +1119,60 @@ if run_btn and uploaded:
                             ref_pil.save(rb, format="JPEG", quality=92)
                             ref_bytes_list.append(rb.getvalue())
 
-                        # Optional style reference images (atmosphere inspiration only)
-                        style_ref_bytes = []
-                        if style_ref_files:
-                            for f in style_ref_files[:4]:
-                                sr_pil = Image.open(io.BytesIO(f.read())).convert("RGB")
-                                if max(sr_pil.size) > 1200:
-                                    ratio = 1200 / max(sr_pil.size)
-                                    sr_pil = sr_pil.resize((int(sr_pil.width * ratio), int(sr_pil.height * ratio)), Image.LANCZOS)
-                                sb = io.BytesIO()
-                                sr_pil.save(sb, format="JPEG", quality=85)
-                                style_ref_bytes.append(sb.getvalue())
+                        scene_templates = []
+                        for ref_file, ref_tagline in scene_template_inputs:
+                            if ref_file is None:
+                                continue
+                            sr_pil = Image.open(io.BytesIO(ref_file.read())).convert("RGB")
+                            if max(sr_pil.size) > 1200:
+                                ratio = 1200 / max(sr_pil.size)
+                                sr_pil = sr_pil.resize((int(sr_pil.width * ratio), int(sr_pil.height * ratio)), Image.LANCZOS)
+                            sb = io.BytesIO()
+                            sr_pil.save(sb, format="JPEG", quality=85)
+                            scene_templates.append({"img_bytes": sb.getvalue(), "tagline": (ref_tagline or "").strip()})
 
                         atmosphere_errors = []
-                        style_note = f" + {len(style_ref_bytes)} רפרנסי סגנון" if style_ref_bytes else ""
-                        with st.status(f"מייצר תמונות אווירה ({len(ref_bytes_list)} תמונות מוצר{style_note})...", expanded=True) as status:
-                            for i in range(4):
-                                status.update(label=f"מייצר תמונה {i+1}/4 - דיוק מוצר מקסימלי...")
-                                try:
-                                    atm = generate_atmosphere_image(gemini_client, ref_bytes_list, style_ref_bytes or None, user_notes=user_notes)
-                                    atmospheres_clean.append(atm)
-                                except Exception as e:
-                                    atmosphere_errors.append(f"תמונה {i+1}: {type(e).__name__}: {e}")
-                            status.update(label=f"נוצרו {len(atmospheres_clean)} תמונות אווירה", state="complete")
+                        if scene_templates:
+                            n = len(scene_templates)
+                            with st.status(f"מייצר {n} תמונות אווירה לפי תבניות סצנה...", expanded=True) as status:
+                                for i, tpl in enumerate(scene_templates):
+                                    status.update(label=f"מייצר תמונה {i+1}/{n} לפי תבנית סצנה {i+1}...")
+                                    try:
+                                        atm = generate_atmosphere_image(
+                                            gemini_client, ref_bytes_list,
+                                            scene_template_bytes=tpl["img_bytes"],
+                                            user_notes=user_notes,
+                                        )
+                                        atmospheres_clean.append(atm)
+                                        user_taglines_per_atm.append(tpl["tagline"])
+                                    except Exception as e:
+                                        atmosphere_errors.append(f"תמונה {i+1}: {type(e).__name__}: {e}")
+                                status.update(label=f"נוצרו {len(atmospheres_clean)} תמונות אווירה", state="complete")
+                        else:
+                            with st.status(f"מייצר תמונות אווירה ({len(ref_bytes_list)} תמונות מוצר)...", expanded=True) as status:
+                                for i in range(4):
+                                    status.update(label=f"מייצר תמונה {i+1}/4 - דיוק מוצר מקסימלי...")
+                                    try:
+                                        atm = generate_atmosphere_image(gemini_client, ref_bytes_list, user_notes=user_notes)
+                                        atmospheres_clean.append(atm)
+                                        user_taglines_per_atm.append("")
+                                    except Exception as e:
+                                        atmosphere_errors.append(f"תמונה {i+1}: {type(e).__name__}: {e}")
+                                status.update(label=f"נוצרו {len(atmospheres_clean)} תמונות אווירה", state="complete")
                         for err in atmosphere_errors:
                             st.error(err)
 
                         if atmospheres_clean:
-                            with st.status("מנתח תמונות ומתאים משפטי שיווק...", expanded=True) as status:
+                            with st.status("מתאים פסי שיווק...", expanded=True) as status:
                                 used_taglines = []
                                 for i, atm in enumerate(atmospheres_clean):
-                                    status.update(label=f"מתאים טקסט לתמונה {i+1}/{len(atmospheres_clean)}...")
-                                    placement = analyze_image_for_strip(client, atm, hebrew_content, used_taglines, user_notes=user_notes)
+                                    status.update(label=f"מתאים פס שיווקי לתמונה {i+1}/{len(atmospheres_clean)}...")
+                                    user_tag = user_taglines_per_atm[i] if i < len(user_taglines_per_atm) else ""
+                                    if user_tag:
+                                        placement = analyze_strip_placement(client, atm)
+                                        placement["tagline"] = user_tag
+                                    else:
+                                        placement = analyze_image_for_strip(client, atm, hebrew_content, used_taglines, user_notes=user_notes)
                                     used_taglines.append(placement["tagline"])
                                     striped = draw_marketing_strip(atm, placement["tagline"], placement)
                                     atmospheres_striped.append(striped)
