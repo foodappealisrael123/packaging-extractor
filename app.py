@@ -310,13 +310,43 @@ PRODUCT_PRESERVATION_RULES = (
     "Your ONLY creative freedom is in the SCENE AROUND the product (background, lighting, props, food styling)."
 )
 
-# Intentionally minimal - we let Gemini choose the scene freely to maximize product fidelity.
-# The preservation rules appear FIRST in the final prompt (they get higher attention weight).
+# Fallback when no scene description is provided AND no flavor is selected.
 MINIMAL_ATMOSPHERE_PROMPT = (
     "Create a beautiful professional lifestyle product photograph of the item shown in the reference images. "
     "You decide the scene, lighting, and composition - whatever makes the product look its most appealing "
     "in a natural setting suitable for a premium e-commerce website."
 )
+
+# Distinct generic atmosphere "flavors" — assigned to generic slots so the user always
+# gets visually different generic atmospheres instead of four near-identical kitchen counters.
+GENERIC_SCENE_FLAVORS = [
+    (
+        "Bright modern kitchen counter scene. The product sits on a wooden cutting board with fresh seasonal "
+        "ingredients arranged loosely around it: cherry tomatoes on the vine, a sprig of rosemary, a few cloves "
+        "of garlic, a small ceramic dish of coarse salt, and a wooden spoon. White subway-tile splashback in the "
+        "soft-focus background. Warm late-morning light streaming from a window on the left. 3/4 angle, "
+        "eye-level, full-product shot occupying the lower-center of the frame, no hands visible."
+    ),
+    (
+        "Dramatic stovetop scene. The product is centered on a glass induction or gas stovetop with a soft burner "
+        "glow visible underneath, gentle steam rising from above. Dark moody kitchen background with brushed-steel "
+        "range hood and copper-toned utensils on a hanging rail, slightly out of focus. Slight 3/4 angle, "
+        "slightly above eye-level, product centered, cinematic side-lighting from the upper right."
+    ),
+    (
+        "Family dining table set for a meal. The product is the centerpiece on a rustic wooden dining table, "
+        "surrounded by a linen runner, two ceramic plates with neutral-toned napkins, simple water glasses, "
+        "a small vase of dried wheat. Warm golden afternoon light streaming through a large window in the "
+        "background, soft bokeh. Top-down angle slightly tilted, full-product shot."
+    ),
+    (
+        "Minimal premium kitchen island scene. The product sits alone, hero-style, on a clean white marble or "
+        "light oak countertop. A single styled prop nearby (a bunch of fresh thyme tied with twine, or a small "
+        "bowl of olive oil with a sprig of rosemary). Soft overhead diffused daylight, modern minimal background "
+        "with brushed-steel faucet softly out of focus. Eye-level angle, product front-and-center, e-commerce "
+        "studio-lifestyle aesthetic."
+    ),
+]
 
 
 FALLBACK_TAGLINES = [
@@ -545,6 +575,53 @@ def extract_marketing_taglines(client: anthropic.Anthropic, hebrew_content: str)
     return json.loads(text)
 
 
+def describe_product_invariants(client: anthropic.Anthropic, product_img_bytes_list: list[bytes]) -> str:
+    """Use Claude Vision to enumerate the unchangeable visual facts of the product
+    (exact handle count, lid type/material, body color, distinguishing details).
+    The result is injected into every Gemini prompt to anchor against hallucination
+    (e.g., 3 handles instead of 2, transparent lid instead of opaque)."""
+    if not product_img_bytes_list:
+        return ""
+    img_bytes = product_img_bytes_list[0]
+    img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+    if max(img.size) > 1024:
+        ratio = 1024 / max(img.size)
+        img = img.resize((int(img.width * ratio), int(img.height * ratio)), Image.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=88)
+    b64 = base64.standard_b64encode(buf.getvalue()).decode()
+
+    msg = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=500,
+        messages=[{
+            "role": "user",
+            "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}},
+                {"type": "text", "text": (
+                    "List the UNCHANGEABLE visual facts about this product so an image-generation model "
+                    "doesn't hallucinate when rendering it into different scenes.\n\n"
+                    "Reply as a compact bullet list (5-12 short bullets, one per line, each prefixed with '- '). "
+                    "Cover ALL of the following where applicable:\n"
+                    "- HANDLES — exact count (e.g., '2 side handles, exactly opposite each other'), color, shape, "
+                    "attachment style. Be very explicit about the COUNT, since AI models often add an extra handle.\n"
+                    "- LID — does the product have a lid in the photo? If yes: material (opaque metal / glass / "
+                    "plastic / ceramic / etc.), shape (flat / domed / stepped), color, knob style. State explicitly "
+                    "if the lid is opaque (NOT transparent) or transparent (glass).\n"
+                    "- KNOBS / SPOUTS / LEGS / FEET — exact count and style.\n"
+                    "- BODY — shape, color, finish (copper / brushed stainless / matte black non-stick / cast iron / "
+                    "ceramic / etc.). Be explicit about color.\n"
+                    "- BRANDING — any visible logo or text? quote it.\n"
+                    "- DISTINCTIVE DETAILS that AI tends to mis-render: rivets, decorative bands, two-tone color "
+                    "combinations, specific handle attachment hardware, etc.\n\n"
+                    "Output ONLY the bullet list. No preamble. No markdown headers."
+                )},
+            ],
+        }],
+    )
+    return msg.content[0].text.strip()
+
+
 def describe_scene_for_replication(client: anthropic.Anthropic, template_bytes: bytes) -> str:
     """Use Claude Vision to write a detailed text description of the reference scene
     (setting, camera, lighting, props, product position, framing scale, functional state)
@@ -601,9 +678,8 @@ def describe_scene_for_replication(client: anthropic.Anthropic, template_bytes: 
 
 
 def _verify_hebrew_text_clean(client: anthropic.Anthropic, text: str) -> bool:
-    """Ask Claude whether a given Hebrew string is grammatical, correctly-spelled, and coherent.
-    Used as a second pass on OCR'd strip text to filter out garbled OCR results.
-    Returns True only if Claude is confident the text is clean."""
+    """Ask Claude whether a given Hebrew string is readable Hebrew (not garbled OCR output).
+    Permissive by default — only rejects text that is clearly broken or nonsensical."""
     if not text or len(text) < 3:
         return False
     msg = client.messages.create(
@@ -614,43 +690,66 @@ def _verify_hebrew_text_clean(client: anthropic.Anthropic, text: str) -> bool:
             "content": [{
                 "type": "text",
                 "text": (
-                    f"Hebrew text to verify:\n«{text}»\n\n"
-                    "Check ALL of these:\n"
-                    "1. Every word is correctly spelled (no letter swaps, no typos).\n"
-                    "2. The grammar is valid Hebrew.\n"
-                    "3. The phrase is coherent and makes sense as marketing/product copy.\n\n"
-                    "Reply with EXACTLY one word, no punctuation, no explanation:\n"
-                    "- YES if all three checks pass with high confidence\n"
-                    "- NO if anything is misspelled, ungrammatical, or incoherent (even slightly)"
+                    f"Hebrew text:\n«{text}»\n\n"
+                    "Is this text readable, meaningful Hebrew that a customer could understand as marketing copy "
+                    "(even if grammar isn't perfect)?\n\n"
+                    "Reply with EXACTLY one word:\n"
+                    "- NO only if the text is clearly garbled / nonsensical / has multiple unreadable words / "
+                    "clearly broken by OCR errors\n"
+                    "- YES otherwise (default — when in doubt, say YES)"
                 ),
             }],
         }],
     )
-    return msg.content[0].text.strip().upper().startswith("Y")
+    response = msg.content[0].text.strip().upper()
+    return not response.startswith("N")  # accept unless explicit NO
+
+
+# Gemini image-generation model fallback chain. Per user preference, the 3.1 Flash preview
+# (Nano Banana 2) is the primary; we fall back to Pro and then the original 2.5 only if 3.1
+# is unavailable for the user's API key/region.
+GEMINI_IMAGE_MODELS = (
+    "gemini-3.1-flash-image-preview",  # Nano Banana 2 — primary
+    "gemini-3-pro-image-preview",      # Nano Banana Pro — fallback
+    "gemini-2.5-flash-image",          # Nano Banana — final fallback
+)
 
 
 def generate_atmosphere_image(
     gemini_client,
     product_img_bytes_list: list[bytes],
     scene_description: str | None = None,
+    product_invariants: str = "",
     prompt: str = MINIMAL_ATMOSPHERE_PROMPT,
     user_notes: str = "",
 ) -> bytes:
-    """Generate a lifestyle image using Gemini 2.5 Flash Image.
+    """Generate a lifestyle image using Gemini's image-generation model.
 
     product_img_bytes_list: the actual product photos — must be preserved pixel-accurate.
     scene_description: OPTIONAL English text description of a target scene (output of
         describe_scene_for_replication). When provided, Gemini receives ONLY this text
         and OUR product images — never the original template image. This prevents Gemini
         from carrying the template's product over into the output.
+    product_invariants: OPTIONAL bullet list of unchangeable product facts (handle count,
+        lid material, etc.) to anchor against hallucination.
     user_notes: optional user instructions/emphasis to steer the atmosphere."""
     from google.genai import types as gen_types
     product_imgs = [Image.open(io.BytesIO(b)) for b in product_img_bytes_list]
 
+    invariants_block = ""
+    if product_invariants.strip():
+        invariants_block = (
+            "## STRICT PRODUCT FACTS (must match exactly — do not hallucinate)\n"
+            f"{product_invariants.strip()}\n\n"
+            "If your output deviates from any of these facts (wrong handle count, wrong lid material/shape, "
+            "wrong color, invented features) the result is wrong. Double-check before finishing.\n\n"
+        )
+
     if scene_description:
         full_prompt = (
             PRODUCT_PRESERVATION_RULES + "\n\n"
-            f"The {len(product_imgs)} reference images show OUR PRODUCT. Preserve its IDENTITY pixel-accurately: "
+            + invariants_block
+            + f"The {len(product_imgs)} reference images show OUR PRODUCT. Preserve its IDENTITY pixel-accurately: "
             "same exact shape, color, handles, lid design, proportions, branding, material, surface finish.\n\n"
             "Place OUR product into the following scene, exactly as described:\n\n"
             f"=== SCENE TO RENDER ===\n{scene_description}\n=== END SCENE ===\n\n"
@@ -665,7 +764,8 @@ def generate_atmosphere_image(
             "with the rest of the product cropped out.\n"
             "- If the scene says 'tilted forward pouring liquid' → render OUR product tilted that way.\n"
             "What must stay constant from the reference photos: identity (which product it is — same shape, color, "
-            "handles, branding). What must follow the scene description: state, framing, scale, orientation, position.\n\n"
+            "handles, branding, exact handle count, lid material). What must follow the scene description: state, "
+            "framing, scale, orientation, position.\n\n"
             "## Output requirements\n"
             "Render this scene as a high-quality, professional, photorealistic lifestyle photograph for an "
             "e-commerce product page. The ONLY product visible in your output is OUR product (from the reference images). "
@@ -673,7 +773,7 @@ def generate_atmosphere_image(
             "Do not draw any text, captions, logos, banners, marketing strips, or watermarks anywhere in the output."
         )
     else:
-        full_prompt = PRODUCT_PRESERVATION_RULES + "\n\n" + prompt
+        full_prompt = PRODUCT_PRESERVATION_RULES + "\n\n" + invariants_block + prompt
 
     if user_notes.strip():
         full_prompt += (
@@ -684,32 +784,41 @@ def generate_atmosphere_image(
     config = gen_types.GenerateContentConfig(response_modalities=["TEXT", "IMAGE"])
     contents = [full_prompt, *product_imgs]
 
-    try:
-        response = gemini_client.models.generate_content(
-            model="gemini-2.5-flash-image",
-            contents=contents,
-            config=config,
-        )
-    except Exception as e:
-        raise RuntimeError(f"gemini-2.5-flash-image call failed: {type(e).__name__}: {e}") from e
+    last_err: Exception | None = None
+    for model_name in GEMINI_IMAGE_MODELS:
+        try:
+            response = gemini_client.models.generate_content(
+                model=model_name,
+                contents=contents,
+                config=config,
+            )
+        except Exception as e:
+            err_text = str(e)
+            # 404 / not-found → model not available for this key; try next in chain
+            if "404" in err_text or "not found" in err_text.lower() or "NOT_FOUND" in err_text:
+                last_err = e
+                continue
+            raise RuntimeError(f"{model_name} call failed: {type(e).__name__}: {e}") from e
 
-    parts = response.candidates[0].content.parts if response.candidates else []
-    for part in parts:
-        if part.inline_data is not None:
-            raw = part.inline_data.data
-            img = Image.open(io.BytesIO(raw))
-            side = min(img.width, img.height)
-            left = (img.width - side) // 2
-            top = (img.height - side) // 2
-            img = img.crop((left, top, left + side, top + side))
-            if img.width != 900:
-                img = img.resize((900, 900), Image.LANCZOS)
-            buf = io.BytesIO()
-            img.convert("RGB").save(buf, format="JPEG", quality=92)
-            return buf.getvalue()
+        parts = response.candidates[0].content.parts if response.candidates else []
+        for part in parts:
+            if part.inline_data is not None:
+                raw = part.inline_data.data
+                img = Image.open(io.BytesIO(raw))
+                side = min(img.width, img.height)
+                left = (img.width - side) // 2
+                top = (img.height - side) // 2
+                img = img.crop((left, top, left + side, top + side))
+                if img.width != 900:
+                    img = img.resize((900, 900), Image.LANCZOS)
+                buf = io.BytesIO()
+                img.convert("RGB").save(buf, format="JPEG", quality=92)
+                return buf.getvalue()
 
-    text_back = getattr(response, "text", "") or "(empty)"
-    raise RuntimeError(f"Gemini returned no image (likely safety-blocked). Response text: {text_back[:200]}")
+        text_back = getattr(response, "text", "") or "(empty)"
+        last_err = RuntimeError(f"{model_name} returned no image (likely safety-blocked). Response: {text_back[:200]}")
+
+    raise last_err if last_err else RuntimeError("All Gemini image models failed")
 
 
 def analyze_strip_placement(client: anthropic.Anthropic, image_bytes: bytes) -> dict:
@@ -1067,6 +1176,18 @@ def run_atmosphere_pipeline(
     if not gemini_client or not ref_bytes_list:
         return atmospheres_clean, atmospheres_striped
 
+    # ── Step 0: extract product invariants (handle count, lid type, color, etc.) ONCE.
+    # These get injected into every Gemini prompt so the model can't hallucinate (e.g.,
+    # 3 handles instead of 2, transparent lid instead of opaque).
+    product_invariants = ""
+    with st.status("סורק את המוצר ומחלץ עובדות שאסור לשנות (ידיות, מכסה, צבע)...", expanded=False) as status:
+        try:
+            product_invariants = describe_product_invariants(client, ref_bytes_list)
+        except Exception as e:
+            errors_init = f"לא הצלחתי לחלץ עובדות מוצר ({type(e).__name__}); ממשיך בלי. {e}"
+            st.info(errors_init)
+        status.update(label="עובדות המוצר חולצו" if product_invariants else "ללא עובדות מוצר", state="complete")
+
     # ── Step 1: ingest scene templates — OCR strip text + ask Claude to describe the scene
     # We deliberately keep the template image away from Gemini and pass only the text
     # description, so Gemini has no original-product pixels to anchor on.
@@ -1116,24 +1237,35 @@ def run_atmosphere_pipeline(
                 })
             status.update(label=f"{len(scene_templates)} רפרנסים מוכנים", state="complete")
 
-    # ── Step 2: build tasks — ONE image per non-studio template, then pad with generic atmospheres up to target_count
+    # ── Step 2: build tasks — ONE image per non-studio template, then pad with DIFFERENT
+    # generic-flavor scenes (so generic slots produce visually distinct outputs, not 4 of
+    # the same kitchen counter).
     tasks: list[dict] = []
     for tpl in scene_templates:
         if tpl["is_studio_shot"] or not tpl["scene_description"]:
-            # Studio shot or failed description → treat as a generic slot (still keeps user's tagline)
+            # Studio shot or failed description → mark as generic slot but keep user's tagline
             tasks.append({
                 "scene_template_bytes": None,
-                "scene_description": "",
+                "scene_description": None,    # filled later from GENERIC_SCENE_FLAVORS
                 "tagline": tpl["tagline"],
+                "is_generic": True,
             })
         else:
             tasks.append({
                 "scene_template_bytes": tpl["img_bytes"],     # for validator only
                 "scene_description": tpl["scene_description"],
                 "tagline": tpl["tagline"],
+                "is_generic": False,
             })
     while len(tasks) < target_count:
-        tasks.append({"scene_template_bytes": None, "scene_description": "", "tagline": ""})
+        tasks.append({"scene_template_bytes": None, "scene_description": None, "tagline": "", "is_generic": True})
+
+    # Assign distinct generic flavors round-robin to all generic slots
+    flavor_idx = 0
+    for task in tasks:
+        if task["is_generic"]:
+            task["scene_description"] = GENERIC_SCENE_FLAVORS[flavor_idx % len(GENERIC_SCENE_FLAVORS)]
+            flavor_idx += 1
 
     # ── Step 3: generate (with optional validator + retry)
     user_taglines_per_atm: list[str] = []
@@ -1158,6 +1290,7 @@ def run_atmosphere_pipeline(
                     last_atm = generate_atmosphere_image(
                         gemini_client, ref_bytes_list,
                         scene_description=task.get("scene_description") or None,
+                        product_invariants=product_invariants,
                         user_notes=user_notes,
                     )
                 except Exception as e:
@@ -1196,9 +1329,13 @@ def run_atmosphere_pipeline(
         while len(atmospheres_clean) < target_count:
             status.update(label=f"משלים — מייצר תמונה גנרית נוספת ({len(atmospheres_clean)+1}/{target_count})...")
             try:
+                # Pick a different flavor than what's already been used to keep variety
+                fallback_flavor = GENERIC_SCENE_FLAVORS[len(atmospheres_clean) % len(GENERIC_SCENE_FLAVORS)]
                 extra = generate_atmosphere_image(
                     gemini_client, ref_bytes_list,
-                    scene_description=None, user_notes=user_notes,
+                    scene_description=fallback_flavor,
+                    product_invariants=product_invariants,
+                    user_notes=user_notes,
                 )
                 atmospheres_clean.append(extra)
                 user_taglines_per_atm.append("")
