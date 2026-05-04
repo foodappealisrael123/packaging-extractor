@@ -565,14 +565,27 @@ def generate_atmosphere_image(
     if template_img is not None:
         full_prompt = (
             PRODUCT_PRESERVATION_RULES + "\n\n"
-            f"The first {len(product_imgs)} images show the EXACT PRODUCT — preserve it pixel-accurately in your output.\n\n"
-            "The LAST image is a SCENE TEMPLATE. Reproduce its scene faithfully: same composition, "
-            "same camera angle and framing, same lighting style and direction, same setting/environment, "
-            "same overall mood and color palette. "
-            "Replace the product visible in the scene template with OUR product (from the first images), "
-            "keeping it in roughly the same position, scale, and orientation that the template's product had. "
-            "The original product from the template must NOT appear in the output — only OUR product. "
-            "Do NOT copy any text, captions, logos, watermarks, banners, or overlays from the scene template."
+            f"The first {len(product_imgs)} images show OUR PRODUCT — the only product allowed in your output. "
+            "Preserve it pixel-accurately: shape, color, handles, lid, branding, proportions, finish — all exact.\n\n"
+            "The LAST image is a SCENE TEMPLATE. You will use ONLY its scene, NOT its product.\n\n"
+            "## What to COPY from the scene template:\n"
+            "- The setting / environment / background\n"
+            "- Camera angle, framing, distance, perspective\n"
+            "- Lighting style, direction, color temperature, shadows\n"
+            "- Mood, atmosphere, color palette\n"
+            "- Surfaces, props, hands, food, garnishes, utensils — everything EXCEPT the product itself\n"
+            "- The position, scale, and orientation that the template's product occupies in the frame\n\n"
+            "## What is FORBIDDEN — must NOT appear in your output:\n"
+            "- The product visible in the scene template. It is forbidden. Do not draw it. Do not keep it. "
+            "Do not put it next to OUR product. Do not include both products. There is only ONE product in the output, and it is OURS.\n"
+            "- Any text, captions, logos, watermarks, banners, marketing strips, badges, or overlays from the template.\n\n"
+            "## What to DO:\n"
+            "Reconstruct the template's scene from scratch, but with OUR product placed exactly where the template's product was — "
+            "same spot, same scale, same orientation. Hands holding the template's product? Hands now hold OUR product. "
+            "Template's product on a stove? OUR product is now on that stove. Template's product being washed in a sink? "
+            "OUR product is now being washed in that sink. Replace, do not add.\n\n"
+            "Final check before finishing: count the products in your output. There must be exactly ONE, and it must match "
+            "the first reference images (OUR product), not the template's product."
         )
     else:
         full_prompt = PRODUCT_PRESERVATION_RULES + "\n\n" + prompt
@@ -661,8 +674,133 @@ Respond with ONLY valid JSON, nothing else:
         return {"strip_position": "bottom", "strip_color": "#8B0000", "text_color": "#FFFFFF", "strip_height_ratio": 0.12}
 
 
+def extract_strip_text_from_reference(client: anthropic.Anthropic, ref_bytes: bytes) -> str:
+    """If the reference image already has a marketing strip/banner with Hebrew text on it,
+    return that text. Otherwise return ''."""
+    img = Image.open(io.BytesIO(ref_bytes)).convert("RGB")
+    if max(img.size) > 800:
+        ratio = 800 / max(img.size)
+        img = img.resize((int(img.width * ratio), int(img.height * ratio)), Image.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=85)
+    b64 = base64.standard_b64encode(buf.getvalue()).decode()
+
+    msg = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=200,
+        messages=[{
+            "role": "user",
+            "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}},
+                {"type": "text", "text": (
+                    "Does this image contain a marketing strip or banner (a colored bar at the top or bottom) "
+                    "with Hebrew marketing text on it? "
+                    "If YES → reply with ONLY the Hebrew text from that strip, exactly as written, no quotes, no prefix, no explanation. "
+                    "If NO (no strip, or strip without Hebrew text) → reply with ONLY the single word: NONE"
+                )},
+            ],
+        }],
+    )
+    text = msg.content[0].text.strip().strip('"').strip("'").strip()
+    if text.upper() == "NONE" or len(text) < 3:
+        return ""
+    return text
+
+
+def validate_atmosphere_image(
+    client: anthropic.Anthropic,
+    output_bytes: bytes,
+    product_ref_bytes: bytes,
+    scene_template_bytes: bytes | None,
+) -> dict:
+    """Use Claude Vision to verify that the generated atmosphere shows OUR product
+    (matching the product reference) and — if a scene template was used — does NOT
+    show the template's original product. Returns {"ok": bool, "reason": str}."""
+    def _b64(b: bytes, max_dim: int = 700) -> str:
+        img = Image.open(io.BytesIO(b)).convert("RGB")
+        if max(img.size) > max_dim:
+            ratio = max_dim / max(img.size)
+            img = img.resize((int(img.width * ratio), int(img.height * ratio)), Image.LANCZOS)
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=80)
+        return base64.standard_b64encode(buf.getvalue()).decode()
+
+    content = [
+        {"type": "text", "text": "Image A — OUR product (the product that MUST appear in the output, matching shape/color/branding):"},
+        {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": _b64(product_ref_bytes)}},
+    ]
+    if scene_template_bytes:
+        content += [
+            {"type": "text", "text": "Image B — SCENE TEMPLATE. Only its scene/environment/composition should be reproduced. Its product is FORBIDDEN in the output:"},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": _b64(scene_template_bytes)}},
+        ]
+    content += [
+        {"type": "text", "text": "Image C — GENERATED OUTPUT under review:"},
+        {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": _b64(output_bytes)}},
+    ]
+
+    if scene_template_bytes:
+        instruction = (
+            "Review image C. Decide:\n"
+            '1. "product_match": Does C clearly show OUR product (matching A in shape, color, handles, lid, branding)? Answer true/false.\n'
+            '2. "template_product_absent": Is the product from B absent from C? (true if only OUR product is visible, '
+            'false if B\'s product is still in C, or if both products appear together)\n'
+            '3. "scene_match": Does C reproduce B\'s scene/setting/composition reasonably (same kind of environment/angle/mood)? Answer true/false.\n'
+            'Return ONLY a JSON object: {"product_match": bool, "template_product_absent": bool, "scene_match": bool, "reason": "<one short sentence>"}'
+        )
+    else:
+        instruction = (
+            "Review image C. Decide:\n"
+            '1. "product_match": Does C clearly show OUR product (matching A in shape, color, handles, lid, branding)? Answer true/false.\n'
+            '2. "professional_quality": Does C look like a professional lifestyle/marketing photograph (good lighting, composition, no obvious AI artifacts)? Answer true/false.\n'
+            'Return ONLY a JSON object: {"product_match": bool, "professional_quality": bool, "reason": "<one short sentence>"}'
+        )
+    content.append({"type": "text", "text": instruction})
+
+    msg = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=300,
+        messages=[{"role": "user", "content": content}],
+    )
+    text = msg.content[0].text.strip()
+    if text.startswith("```"):
+        text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+        if text.startswith("json"):
+            text = text[4:].strip()
+    try:
+        data = json.loads(text)
+        if scene_template_bytes:
+            ok = bool(data.get("product_match")) and bool(data.get("template_product_absent")) and bool(data.get("scene_match"))
+        else:
+            ok = bool(data.get("product_match")) and bool(data.get("professional_quality"))
+        return {"ok": ok, "reason": data.get("reason", "")}
+    except Exception:
+        return {"ok": True, "reason": "validator parse error - skipped"}
+
+
+def _measure_text_width(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont) -> int:
+    l, _, r, _ = draw.textbbox((0, 0), text, font=font)
+    return r - l
+
+
+def _split_two_lines(text: str) -> list[str]:
+    """Split text into two roughly-equal lines at the closest word boundary."""
+    words = text.split()
+    if len(words) < 2:
+        return [text]
+    target = len(text) / 2
+    best_i, best_diff = 1, float("inf")
+    for i in range(1, len(words)):
+        diff = abs(len(" ".join(words[:i])) - target)
+        if diff < best_diff:
+            best_diff, best_i = diff, i
+    return [" ".join(words[:best_i]), " ".join(words[best_i:])]
+
+
 def draw_marketing_strip(image_bytes: bytes, tagline: str, placement: dict) -> bytes:
-    """Draw a colored strip with Hebrew tagline on top/bottom of the image."""
+    """Draw a colored strip with Hebrew tagline on top/bottom of the image.
+    Auto-fits the text: shrinks the font to fit; falls back to two lines if even
+    the smallest font won't fit on a single line."""
     from bidi.algorithm import get_display
 
     img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
@@ -670,27 +808,61 @@ def draw_marketing_strip(image_bytes: bytes, tagline: str, placement: dict) -> b
     strip_h = int(H * placement["strip_height_ratio"])
     pos = placement["strip_position"]
 
+    max_text_width = int(W * 0.92)
+    initial_font_size = int(strip_h * 0.55)
+    min_font_size = max(14, int(strip_h * 0.30))
     draw = ImageDraw.Draw(img)
+
+    # Try single line, shrinking font down to min
+    display_text = get_display(tagline)
+    one_line_size = None
+    for size in range(initial_font_size, min_font_size - 1, -2):
+        font = _load_font(size)
+        if _measure_text_width(draw, display_text, font) <= max_text_width:
+            one_line_size = size
+            break
+
+    if one_line_size is not None:
+        lines = [display_text]
+        font_size = one_line_size
+    else:
+        # Wrap to two lines and pick a font size that fits both within max width
+        raw_lines = _split_two_lines(tagline)
+        if len(raw_lines) == 1:
+            lines = [display_text]
+            font_size = min_font_size
+        else:
+            lines = [get_display(line) for line in raw_lines]
+            two_line_max = int(strip_h * 0.42)
+            font_size = max(12, min_font_size)
+            for size in range(two_line_max, 11, -2):
+                font = _load_font(size)
+                widths = [_measure_text_width(draw, line, font) for line in lines]
+                if max(widths) <= max_text_width:
+                    font_size = size
+                    break
+
+    font = _load_font(font_size)
+
     if pos == "top":
         strip_box = (0, 0, W, strip_h)
     else:
         strip_box = (0, H - strip_h, W, H)
     draw.rectangle(strip_box, fill=placement["strip_color"])
 
-    # Hebrew text: reorder for RTL
-    display_text = get_display(tagline)
-    font_size = int(strip_h * 0.55)
-    font = _load_font(font_size)
-
-    l, t, r, b = draw.textbbox((0, 0), display_text, font=font)
-    tw, th = r - l, b - t
-    x = (W - tw) // 2 - l
+    line_height = int(font_size * 1.15)
+    total_text_height = line_height * len(lines) - int(font_size * 0.15)
     if pos == "top":
-        y = (strip_h - th) // 2 - t
+        y_start = (strip_h - total_text_height) // 2
     else:
-        y = (H - strip_h) + (strip_h - th) // 2 - t
+        y_start = (H - strip_h) + (strip_h - total_text_height) // 2
 
-    draw.text((x, y), display_text, font=font, fill=placement["text_color"])
+    for idx, line in enumerate(lines):
+        l, t, r, b = draw.textbbox((0, 0), line, font=font)
+        tw = r - l
+        x = (W - tw) // 2 - l
+        y = y_start + idx * line_height - t
+        draw.text((x, y), line, font=font, fill=placement["text_color"])
 
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=92)
@@ -771,6 +943,149 @@ def create_zip(images: list[dict], hebrew_text: str, bg_removed: bool = False,
                 zf.writestr(f"atmosphere_marketing_{i+1}.jpg", b)
     buf.seek(0)
     return buf.read()
+
+
+def run_atmosphere_pipeline(
+    *,
+    client: anthropic.Anthropic,
+    gemini_client,
+    ref_bytes_list: list[bytes],
+    scene_template_inputs: list,
+    user_notes: str,
+    hebrew_content: str,
+    target_count: int = 4,
+    enable_validator: bool = True,
+    max_retries: int = 2,
+) -> tuple[list[bytes], list[bytes]]:
+    """End-to-end atmosphere image generation:
+    1) Process scene-template uploads, OCR strip text from each as a tagline fallback.
+    2) Build target_count generation tasks (cycle through templates if any, else generic).
+    3) For each task: generate via Gemini, optionally validate via Claude Vision (retry up to max_retries).
+    4) Apply marketing strip with priority: user-typed > OCR'd > auto-generated.
+    Returns (atmospheres_clean, atmospheres_striped)."""
+    atmospheres_clean: list[bytes] = []
+    atmospheres_striped: list[bytes] = []
+    if not gemini_client or not ref_bytes_list:
+        return atmospheres_clean, atmospheres_striped
+
+    # ── Step 1: ingest scene templates + OCR taglines if user didn't type one
+    scene_templates: list[dict] = []
+    if scene_template_inputs:
+        with st.status("מעבד תמונות רפרנס...", expanded=False) as status:
+            for idx, (ref_file, ref_tagline) in enumerate(scene_template_inputs):
+                if ref_file is None:
+                    continue
+                sr_pil = Image.open(io.BytesIO(ref_file.read())).convert("RGB")
+                if max(sr_pil.size) > 1200:
+                    ratio = 1200 / max(sr_pil.size)
+                    sr_pil = sr_pil.resize((int(sr_pil.width * ratio), int(sr_pil.height * ratio)), Image.LANCZOS)
+                sb = io.BytesIO()
+                sr_pil.save(sb, format="JPEG", quality=85)
+                ref_bytes = sb.getvalue()
+
+                effective_tagline = (ref_tagline or "").strip()
+                if not effective_tagline:
+                    status.update(label=f"קורא טקסט מהפס של רפרנס {idx+1}...")
+                    try:
+                        ocr = extract_strip_text_from_reference(client, ref_bytes)
+                        if ocr:
+                            effective_tagline = ocr
+                    except Exception:
+                        pass
+
+                scene_templates.append({"img_bytes": ref_bytes, "tagline": effective_tagline})
+            status.update(label=f"{len(scene_templates)} רפרנסים מוכנים", state="complete")
+
+    # ── Step 2: build generation tasks (always target_count)
+    tasks: list[dict] = []
+    if scene_templates:
+        n = len(scene_templates)
+        for i in range(target_count):
+            tpl = scene_templates[i % n]
+            tasks.append({"scene_template_bytes": tpl["img_bytes"], "tagline": tpl["tagline"]})
+    else:
+        for _ in range(target_count):
+            tasks.append({"scene_template_bytes": None, "tagline": ""})
+
+    # ── Step 3: generate (with optional validator + retry)
+    user_taglines_per_atm: list[str] = []
+    errors: list[str] = []
+    intro = (
+        f"מייצר {target_count} תמונות אווירה ({len(scene_templates)} רפרנסים, מסבב ביניהם)..."
+        if scene_templates else
+        f"מייצר {target_count} תמונות אווירה גנריות..."
+    )
+    with st.status(intro, expanded=True) as status:
+        for i, task in enumerate(tasks):
+            src_label = "תבנית סצנה" if task["scene_template_bytes"] else "גנרי"
+            attempt = 0
+            chosen_atm: bytes | None = None
+            last_atm: bytes | None = None
+            last_reason = ""
+            while attempt <= max_retries:
+                attempt += 1
+                status.update(label=f"מייצר תמונה {i+1}/{target_count} ({src_label}) — ניסיון {attempt}...")
+                try:
+                    last_atm = generate_atmosphere_image(
+                        gemini_client, ref_bytes_list,
+                        scene_template_bytes=task["scene_template_bytes"],
+                        user_notes=user_notes,
+                    )
+                except Exception as e:
+                    errors.append(f"תמונה {i+1} (ניסיון {attempt}): {type(e).__name__}: {e}")
+                    continue
+
+                if not enable_validator:
+                    chosen_atm = last_atm
+                    break
+
+                status.update(label=f"בודק איכות תמונה {i+1}/{target_count} (ניסיון {attempt})...")
+                try:
+                    result = validate_atmosphere_image(
+                        client, last_atm, ref_bytes_list[0], task["scene_template_bytes"]
+                    )
+                except Exception as e:
+                    errors.append(f"תמונה {i+1} (ולידציה): {type(e).__name__}: {e}")
+                    chosen_atm = last_atm
+                    break
+                if result.get("ok"):
+                    chosen_atm = last_atm
+                    break
+                last_reason = result.get("reason", "")
+                # else: retry
+
+            if chosen_atm is None and last_atm is not None:
+                # All retries failed validation; keep the last attempt anyway and warn
+                chosen_atm = last_atm
+                if last_reason:
+                    errors.append(f"תמונה {i+1}: עברה את כל הניסיונות אך הוולידטור התריע: {last_reason}")
+
+            if chosen_atm is not None:
+                atmospheres_clean.append(chosen_atm)
+                user_taglines_per_atm.append(task["tagline"])
+        status.update(label=f"נוצרו {len(atmospheres_clean)} תמונות אווירה", state="complete")
+
+    for err in errors:
+        st.warning(err)
+
+    # ── Step 4: marketing strips
+    if atmospheres_clean:
+        with st.status("מתאים פסי שיווק...", expanded=True) as status:
+            used_taglines: list[str] = []
+            for i, atm in enumerate(atmospheres_clean):
+                status.update(label=f"מתאים פס שיווקי לתמונה {i+1}/{len(atmospheres_clean)}...")
+                user_tag = user_taglines_per_atm[i] if i < len(user_taglines_per_atm) else ""
+                if user_tag:
+                    placement = analyze_strip_placement(client, atm)
+                    placement["tagline"] = user_tag
+                else:
+                    placement = analyze_image_for_strip(client, atm, hebrew_content, used_taglines, user_notes=user_notes)
+                used_taglines.append(placement["tagline"])
+                striped = draw_marketing_strip(atm, placement["tagline"], placement)
+                atmospheres_striped.append(striped)
+            status.update(label="פסי שיווק מוכנים!", state="complete")
+
+    return atmospheres_clean, atmospheres_striped
 
 
 # ─────────────────────────────────────────
@@ -879,15 +1194,26 @@ with col1:
             ),
         )
 
-        gen_atmospheres = st.checkbox("ייצר תמונות אווירה (עד 4 נקיות + 4 עם פס שיווקי) (~$0.16 לקובץ)")
+        gen_atmospheres = st.checkbox("ייצר 4 תמונות אווירה (נקיות + עם פס שיווקי) (~$0.20 לקובץ)")
 
+        enable_validator = True
         scene_template_inputs = []
         if gen_atmospheres:
+            enable_validator = st.checkbox(
+                "🔍 בדיקת איכות אוטומטית (Claude Vision מוודא שהמוצר הנכון בתמונה, עם retry של עד 2 ניסיונות אם לא)",
+                value=True,
+                help=(
+                    "בכל תמונה Claude Vision בודק שהמוצר שלך מופיע בתמונה — ובמצב 'תעשה לי כזה' שגם המוצר של הרפרנס "
+                    "אכן הוחלף ולא נשאר. אם הוולידציה נכשלת, התמונה מיוצרת מחדש (עד 2 פעמים נוספות). "
+                    "מוסיף עלות קטנה אבל משפר משמעותית את האיכות."
+                ),
+            )
             with st.expander("🎯 מצב 'תעשה לי כזה' — תמונות רפרנס כתבנית סצנה (אופציונלי)", expanded=False):
                 st.caption(
-                    "אפשר להעלות עד 4 תמונות רפרנס. לכל תמונה תיוצר תמונת אווירה אחת שמשחזרת את הסצנה והקומפוזיציה שלה — "
-                    "אבל עם המוצר שלך במקום המוצר שברפרנס. אפשר גם לכתוב לכל תמונה משפט שיווקי משלך שיופיע על הפס. "
-                    "אם תשאיר את כל הסלוטים ריקים — ייוצרו 4 תמונות אווירה גנריות עם משפטי שיווק אוטומטיים, כמו קודם."
+                    "אפשר להעלות עד 4 תמונות רפרנס. כשמועלים פחות מ-4, האפליקציה תסבב ביניהן עד שמייצרת 4 תמונות סך הכל. "
+                    "אפשר לכתוב לכל תמונה משפט שיווקי משלך שיופיע על הפס. "
+                    "אם הרפרנס כבר מכיל פס שיווקי בעברית, האפליקציה תקרא ממנו את הטקסט אוטומטית (כשלא הקלדת אחד משלך). "
+                    "אם תשאיר את כל הסלוטים ריקים — ייוצרו 4 תמונות אווירה גנריות עם משפטי שיווק אוטומטיים."
                 )
                 for i in range(4):
                     st.markdown(f"**רפרנס {i+1}:**")
@@ -962,7 +1288,6 @@ if run_btn and uploaded:
             # Atmosphere images
             atmospheres_clean = []
             atmospheres_striped = []
-            user_taglines_per_atm = []
             if gen_atmospheres:
                 if not gemini_key:
                     st.warning("צריך Gemini API Key כדי לייצר תמונות אווירה")
@@ -977,64 +1302,16 @@ if run_btn and uploaded:
                             ref_pil.save(rb, format="JPEG", quality=92)
                             ref_bytes_list.append(rb.getvalue())
 
-                        scene_templates = []
-                        for ref_file, ref_tagline in scene_template_inputs:
-                            if ref_file is None:
-                                continue
-                            sr_pil = Image.open(io.BytesIO(ref_file.read())).convert("RGB")
-                            if max(sr_pil.size) > 1200:
-                                ratio = 1200 / max(sr_pil.size)
-                                sr_pil = sr_pil.resize((int(sr_pil.width * ratio), int(sr_pil.height * ratio)), Image.LANCZOS)
-                            sb = io.BytesIO()
-                            sr_pil.save(sb, format="JPEG", quality=85)
-                            scene_templates.append({"img_bytes": sb.getvalue(), "tagline": (ref_tagline or "").strip()})
-
-                        atmosphere_errors = []
-                        if scene_templates:
-                            n = len(scene_templates)
-                            with st.status(f"מייצר {n} תמונות אווירה לפי תבניות סצנה...", expanded=True) as status:
-                                for i, tpl in enumerate(scene_templates):
-                                    status.update(label=f"מייצר תמונה {i+1}/{n} לפי תבנית סצנה {i+1}...")
-                                    try:
-                                        atm = generate_atmosphere_image(
-                                            gemini_client, ref_bytes_list,
-                                            scene_template_bytes=tpl["img_bytes"],
-                                            user_notes=user_notes,
-                                        )
-                                        atmospheres_clean.append(atm)
-                                        user_taglines_per_atm.append(tpl["tagline"])
-                                    except Exception as e:
-                                        atmosphere_errors.append(f"תמונה {i+1}: {type(e).__name__}: {e}")
-                                status.update(label=f"נוצרו {len(atmospheres_clean)} תמונות אווירה", state="complete")
-                        else:
-                            with st.status(f"מייצר תמונות אווירה ({len(ref_bytes_list)} תמונות מוצר)...", expanded=True) as status:
-                                for i in range(4):
-                                    status.update(label=f"מייצר תמונה {i+1}/4 - דיוק מוצר מקסימלי...")
-                                    try:
-                                        atm = generate_atmosphere_image(gemini_client, ref_bytes_list, user_notes=user_notes)
-                                        atmospheres_clean.append(atm)
-                                        user_taglines_per_atm.append("")
-                                    except Exception as e:
-                                        atmosphere_errors.append(f"תמונה {i+1}: {type(e).__name__}: {e}")
-                                status.update(label=f"נוצרו {len(atmospheres_clean)} תמונות אווירה", state="complete")
-                        for err in atmosphere_errors:
-                            st.error(err)
-
-                        if atmospheres_clean:
-                            with st.status("מתאים פסי שיווק...", expanded=True) as status:
-                                used_taglines = []
-                                for i, atm in enumerate(atmospheres_clean):
-                                    status.update(label=f"מתאים פס שיווקי לתמונה {i+1}/{len(atmospheres_clean)}...")
-                                    user_tag = user_taglines_per_atm[i] if i < len(user_taglines_per_atm) else ""
-                                    if user_tag:
-                                        placement = analyze_strip_placement(client, atm)
-                                        placement["tagline"] = user_tag
-                                    else:
-                                        placement = analyze_image_for_strip(client, atm, hebrew_content, used_taglines, user_notes=user_notes)
-                                    used_taglines.append(placement["tagline"])
-                                    striped = draw_marketing_strip(atm, placement["tagline"], placement)
-                                    atmospheres_striped.append(striped)
-                                status.update(label="פסי שיווק מוכנים!", state="complete")
+                        atmospheres_clean, atmospheres_striped = run_atmosphere_pipeline(
+                            client=client,
+                            gemini_client=gemini_client,
+                            ref_bytes_list=ref_bytes_list,
+                            scene_template_inputs=scene_template_inputs,
+                            user_notes=user_notes,
+                            hebrew_content=hebrew_content,
+                            target_count=4,
+                            enable_validator=enable_validator,
+                        )
                     except Exception as e:
                         st.warning(f"כשל בייצור תמונות אווירה: {e}")
 
@@ -1102,7 +1379,6 @@ if run_btn and uploaded:
             # Step 4 – Atmosphere images + marketing strips (optional)
             atmospheres_clean = []
             atmospheres_striped = []
-            user_taglines_per_atm = []
             if gen_atmospheres:
                 if not gemini_key:
                     st.warning("צריך Gemini API Key כדי לייצר תמונות אווירה - דילגנו על השלב")
@@ -1119,64 +1395,16 @@ if run_btn and uploaded:
                             ref_pil.save(rb, format="JPEG", quality=92)
                             ref_bytes_list.append(rb.getvalue())
 
-                        scene_templates = []
-                        for ref_file, ref_tagline in scene_template_inputs:
-                            if ref_file is None:
-                                continue
-                            sr_pil = Image.open(io.BytesIO(ref_file.read())).convert("RGB")
-                            if max(sr_pil.size) > 1200:
-                                ratio = 1200 / max(sr_pil.size)
-                                sr_pil = sr_pil.resize((int(sr_pil.width * ratio), int(sr_pil.height * ratio)), Image.LANCZOS)
-                            sb = io.BytesIO()
-                            sr_pil.save(sb, format="JPEG", quality=85)
-                            scene_templates.append({"img_bytes": sb.getvalue(), "tagline": (ref_tagline or "").strip()})
-
-                        atmosphere_errors = []
-                        if scene_templates:
-                            n = len(scene_templates)
-                            with st.status(f"מייצר {n} תמונות אווירה לפי תבניות סצנה...", expanded=True) as status:
-                                for i, tpl in enumerate(scene_templates):
-                                    status.update(label=f"מייצר תמונה {i+1}/{n} לפי תבנית סצנה {i+1}...")
-                                    try:
-                                        atm = generate_atmosphere_image(
-                                            gemini_client, ref_bytes_list,
-                                            scene_template_bytes=tpl["img_bytes"],
-                                            user_notes=user_notes,
-                                        )
-                                        atmospheres_clean.append(atm)
-                                        user_taglines_per_atm.append(tpl["tagline"])
-                                    except Exception as e:
-                                        atmosphere_errors.append(f"תמונה {i+1}: {type(e).__name__}: {e}")
-                                status.update(label=f"נוצרו {len(atmospheres_clean)} תמונות אווירה", state="complete")
-                        else:
-                            with st.status(f"מייצר תמונות אווירה ({len(ref_bytes_list)} תמונות מוצר)...", expanded=True) as status:
-                                for i in range(4):
-                                    status.update(label=f"מייצר תמונה {i+1}/4 - דיוק מוצר מקסימלי...")
-                                    try:
-                                        atm = generate_atmosphere_image(gemini_client, ref_bytes_list, user_notes=user_notes)
-                                        atmospheres_clean.append(atm)
-                                        user_taglines_per_atm.append("")
-                                    except Exception as e:
-                                        atmosphere_errors.append(f"תמונה {i+1}: {type(e).__name__}: {e}")
-                                status.update(label=f"נוצרו {len(atmospheres_clean)} תמונות אווירה", state="complete")
-                        for err in atmosphere_errors:
-                            st.error(err)
-
-                        if atmospheres_clean:
-                            with st.status("מתאים פסי שיווק...", expanded=True) as status:
-                                used_taglines = []
-                                for i, atm in enumerate(atmospheres_clean):
-                                    status.update(label=f"מתאים פס שיווקי לתמונה {i+1}/{len(atmospheres_clean)}...")
-                                    user_tag = user_taglines_per_atm[i] if i < len(user_taglines_per_atm) else ""
-                                    if user_tag:
-                                        placement = analyze_strip_placement(client, atm)
-                                        placement["tagline"] = user_tag
-                                    else:
-                                        placement = analyze_image_for_strip(client, atm, hebrew_content, used_taglines, user_notes=user_notes)
-                                    used_taglines.append(placement["tagline"])
-                                    striped = draw_marketing_strip(atm, placement["tagline"], placement)
-                                    atmospheres_striped.append(striped)
-                                status.update(label="פסי שיווק מוכנים!", state="complete")
+                        atmospheres_clean, atmospheres_striped = run_atmosphere_pipeline(
+                            client=client,
+                            gemini_client=gemini_client,
+                            ref_bytes_list=ref_bytes_list,
+                            scene_template_inputs=scene_template_inputs,
+                            user_notes=user_notes,
+                            hebrew_content=hebrew_content,
+                            target_count=4,
+                            enable_validator=enable_validator,
+                        )
                     except Exception as e:
                         st.warning(f"כשל בייצור תמונות אווירה: {e}")
 
