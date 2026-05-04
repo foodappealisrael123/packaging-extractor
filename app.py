@@ -545,47 +545,77 @@ def extract_marketing_taglines(client: anthropic.Anthropic, hebrew_content: str)
     return json.loads(text)
 
 
+def describe_scene_for_replication(client: anthropic.Anthropic, template_bytes: bytes) -> str:
+    """Use Claude Vision to write a detailed text description of the reference scene
+    (setting, camera, lighting, props, product position) WITHOUT describing the product itself.
+    The description is what we send to Gemini instead of the template image, so Gemini has
+    no original-product pixels to anchor on and is forced to render OUR product into the scene."""
+    img = Image.open(io.BytesIO(template_bytes)).convert("RGB")
+    if max(img.size) > 1024:
+        ratio = 1024 / max(img.size)
+        img = img.resize((int(img.width * ratio), int(img.height * ratio)), Image.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=85)
+    b64 = base64.standard_b64encode(buf.getvalue()).decode()
+
+    msg = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=700,
+        messages=[{
+            "role": "user",
+            "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}},
+                {"type": "text", "text": (
+                    "I will use your description to ask an image-generation model to recreate this exact SCENE with a different product placed in it. "
+                    "Write a single dense English paragraph (4-7 sentences) describing the scene in enough visual detail to faithfully reproduce it.\n\n"
+                    "Cover all of these:\n"
+                    "- Setting / environment / room / surface (kitchen counter, dining table, stovetop, sink, garden, etc.)\n"
+                    "- All visible background elements (cabinets, soap dispenser, dish rack, window, tiles, plants, etc.)\n"
+                    "- Camera angle, framing, perspective, distance (3/4 angle, top-down, eye-level close-up, wide, etc.)\n"
+                    "- Lighting style and direction (warm morning light from left, soft overhead diffused, golden hour, studio lighting, etc.)\n"
+                    "- Mood, color palette, time of day\n"
+                    "- All props, food, garnishes, utensils, hands, body parts, water, steam, splashes, etc. — everything in the frame EXCEPT the main product\n"
+                    "- Where in the frame the main product sits, at what scale relative to the frame, and in what orientation (e.g., 'centered in lower third, occupies 40% of frame width, viewed from 3/4 front, slightly tilted right')\n\n"
+                    "STRICT RULES:\n"
+                    "- DO NOT describe the product itself (don't mention its color, material, brand, type, shape). Treat it as a generic 'product'.\n"
+                    "- DO NOT mention any text, banners, marketing strips, logos, captions, or overlays visible on the image — even if there are some. Pretend they don't exist.\n"
+                    "- Output ONLY the paragraph. No preface, no bullets, no markdown."
+                )},
+            ],
+        }],
+    )
+    return msg.content[0].text.strip()
+
+
 def generate_atmosphere_image(
     gemini_client,
     product_img_bytes_list: list[bytes],
-    scene_template_bytes: bytes | None = None,
+    scene_description: str | None = None,
     prompt: str = MINIMAL_ATMOSPHERE_PROMPT,
     user_notes: str = "",
 ) -> bytes:
     """Generate a lifestyle image using Gemini 2.5 Flash Image.
-    product_img_bytes_list: the actual product photos - must be preserved pixel-accurate.
-    scene_template_bytes: OPTIONAL single reference image used as a SCENE TEMPLATE.
-        When provided, Gemini reproduces the reference's scene/composition/lighting/angle
-        but swaps the product visible in it for our product.
+
+    product_img_bytes_list: the actual product photos — must be preserved pixel-accurate.
+    scene_description: OPTIONAL English text description of a target scene (output of
+        describe_scene_for_replication). When provided, Gemini receives ONLY this text
+        and OUR product images — never the original template image. This prevents Gemini
+        from carrying the template's product over into the output.
     user_notes: optional user instructions/emphasis to steer the atmosphere."""
     from google.genai import types as gen_types
     product_imgs = [Image.open(io.BytesIO(b)) for b in product_img_bytes_list]
-    template_img = Image.open(io.BytesIO(scene_template_bytes)) if scene_template_bytes else None
 
-    if template_img is not None:
+    if scene_description:
         full_prompt = (
             PRODUCT_PRESERVATION_RULES + "\n\n"
-            f"The first {len(product_imgs)} images show OUR PRODUCT — the only product allowed in your output. "
-            "Preserve it pixel-accurately: shape, color, handles, lid, branding, proportions, finish — all exact.\n\n"
-            "The LAST image is a SCENE TEMPLATE. You will use ONLY its scene, NOT its product.\n\n"
-            "## What to COPY from the scene template:\n"
-            "- The setting / environment / background\n"
-            "- Camera angle, framing, distance, perspective\n"
-            "- Lighting style, direction, color temperature, shadows\n"
-            "- Mood, atmosphere, color palette\n"
-            "- Surfaces, props, hands, food, garnishes, utensils — everything EXCEPT the product itself\n"
-            "- The position, scale, and orientation that the template's product occupies in the frame\n\n"
-            "## What is FORBIDDEN — must NOT appear in your output:\n"
-            "- The product visible in the scene template. It is forbidden. Do not draw it. Do not keep it. "
-            "Do not put it next to OUR product. Do not include both products. There is only ONE product in the output, and it is OURS.\n"
-            "- Any text, captions, logos, watermarks, banners, marketing strips, badges, or overlays from the template.\n\n"
-            "## What to DO:\n"
-            "Reconstruct the template's scene from scratch, but with OUR product placed exactly where the template's product was — "
-            "same spot, same scale, same orientation. Hands holding the template's product? Hands now hold OUR product. "
-            "Template's product on a stove? OUR product is now on that stove. Template's product being washed in a sink? "
-            "OUR product is now being washed in that sink. Replace, do not add.\n\n"
-            "Final check before finishing: count the products in your output. There must be exactly ONE, and it must match "
-            "the first reference images (OUR product), not the template's product."
+            f"The {len(product_imgs)} reference images show OUR PRODUCT. Preserve it pixel-accurately in your output: "
+            "same exact shape, color, handles, lid, proportions, branding, surface finish.\n\n"
+            "Place OUR product into the following scene, exactly as described:\n\n"
+            f"=== SCENE TO RENDER ===\n{scene_description}\n=== END SCENE ===\n\n"
+            "Render this scene as a high-quality, professional, photorealistic lifestyle photograph for an "
+            "e-commerce product page. The ONLY product visible in your output is OUR product (from the reference images). "
+            "Do not invent any other product, kitchenware item, or object that resembles a separate product. "
+            "Do not draw any text, captions, logos, banners, marketing strips, or watermarks anywhere in the output."
         )
     else:
         full_prompt = PRODUCT_PRESERVATION_RULES + "\n\n" + prompt
@@ -598,38 +628,33 @@ def generate_atmosphere_image(
 
     config = gen_types.GenerateContentConfig(response_modalities=["TEXT", "IMAGE"])
     contents = [full_prompt, *product_imgs]
-    if template_img is not None:
-        contents.append(template_img)
 
-    last_err = None
-    for model_name in (
-        "gemini-2.5-flash-image",
-        "gemini-2.5-flash-image-preview",
-    ):
-        try:
-            response = gemini_client.models.generate_content(
-                model=model_name,
-                contents=contents,
-                config=config,
-            )
-            parts = response.candidates[0].content.parts if response.candidates else []
-            for part in parts:
-                if part.inline_data is not None:
-                    raw = part.inline_data.data
-                    img = Image.open(io.BytesIO(raw))
-                    side = min(img.width, img.height)
-                    left = (img.width - side) // 2
-                    top = (img.height - side) // 2
-                    img = img.crop((left, top, left + side, top + side))
-                    if img.width != 900:
-                        img = img.resize((900, 900), Image.LANCZOS)
-                    buf = io.BytesIO()
-                    img.convert("RGB").save(buf, format="JPEG", quality=92)
-                    return buf.getvalue()
-            last_err = RuntimeError(f"{model_name}: no image in response. Text: {response.text or '(empty)'}")
-        except Exception as e:
-            last_err = e
-    raise last_err if last_err else RuntimeError("Unknown Gemini error")
+    try:
+        response = gemini_client.models.generate_content(
+            model="gemini-2.5-flash-image",
+            contents=contents,
+            config=config,
+        )
+    except Exception as e:
+        raise RuntimeError(f"gemini-2.5-flash-image call failed: {type(e).__name__}: {e}") from e
+
+    parts = response.candidates[0].content.parts if response.candidates else []
+    for part in parts:
+        if part.inline_data is not None:
+            raw = part.inline_data.data
+            img = Image.open(io.BytesIO(raw))
+            side = min(img.width, img.height)
+            left = (img.width - side) // 2
+            top = (img.height - side) // 2
+            img = img.crop((left, top, left + side, top + side))
+            if img.width != 900:
+                img = img.resize((900, 900), Image.LANCZOS)
+            buf = io.BytesIO()
+            img.convert("RGB").save(buf, format="JPEG", quality=92)
+            return buf.getvalue()
+
+    text_back = getattr(response, "text", "") or "(empty)"
+    raise RuntimeError(f"Gemini returned no image (likely safety-blocked). Response text: {text_back[:200]}")
 
 
 def analyze_strip_placement(client: anthropic.Anthropic, image_bytes: bytes) -> dict:
@@ -675,14 +700,15 @@ Respond with ONLY valid JSON, nothing else:
 
 
 def extract_strip_text_from_reference(client: anthropic.Anthropic, ref_bytes: bytes) -> str:
-    """If the reference image already has a marketing strip/banner with Hebrew text on it,
-    return that text. Otherwise return ''."""
+    """If the reference image already has a marketing strip/banner with CLEARLY READABLE Hebrew text,
+    return that text (capped at 60 chars). Returns '' if there's no strip, the text is unclear,
+    or the result looks like gibberish."""
     img = Image.open(io.BytesIO(ref_bytes)).convert("RGB")
-    if max(img.size) > 800:
-        ratio = 800 / max(img.size)
+    if max(img.size) > 1024:
+        ratio = 1024 / max(img.size)
         img = img.resize((int(img.width * ratio), int(img.height * ratio)), Image.LANCZOS)
     buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=85)
+    img.save(buf, format="JPEG", quality=88)
     b64 = base64.standard_b64encode(buf.getvalue()).decode()
 
     msg = client.messages.create(
@@ -694,15 +720,27 @@ def extract_strip_text_from_reference(client: anthropic.Anthropic, ref_bytes: by
                 {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}},
                 {"type": "text", "text": (
                     "Does this image contain a marketing strip or banner (a colored bar at the top or bottom) "
-                    "with Hebrew marketing text on it? "
-                    "If YES → reply with ONLY the Hebrew text from that strip, exactly as written, no quotes, no prefix, no explanation. "
-                    "If NO (no strip, or strip without Hebrew text) → reply with ONLY the single word: NONE"
+                    "with CLEARLY READABLE Hebrew marketing text on it?\n\n"
+                    "Reply with ONE of these — nothing else:\n"
+                    "- The exact Hebrew text from the strip, copied character-by-character. "
+                    "Only do this if every word is unambiguously readable. Do not guess on blurry letters. Do not paraphrase.\n"
+                    "- The single word NONE if there is no strip, or if the strip text is unclear, blurry, ambiguous, or in another language."
                 )},
             ],
         }],
     )
     text = msg.content[0].text.strip().strip('"').strip("'").strip()
     if text.upper() == "NONE" or len(text) < 3:
+        return ""
+    # Cap at 60 chars on a word boundary to keep strip layout sane
+    if len(text) > 60:
+        out = ""
+        for w in text.split():
+            if len(out) + len(w) + 1 > 60:
+                break
+            out = (out + " " + w).strip()
+        text = out or text[:60]
+    if _looks_like_gibberish(text):
         return ""
     return text
 
@@ -741,12 +779,11 @@ def validate_atmosphere_image(
 
     if scene_template_bytes:
         instruction = (
-            "Review image C. Decide:\n"
-            '1. "product_match": Does C clearly show OUR product (matching A in shape, color, handles, lid, branding)? Answer true/false.\n'
-            '2. "template_product_absent": Is the product from B absent from C? (true if only OUR product is visible, '
-            'false if B\'s product is still in C, or if both products appear together)\n'
-            '3. "scene_match": Does C reproduce B\'s scene/setting/composition reasonably (same kind of environment/angle/mood)? Answer true/false.\n'
-            'Return ONLY a JSON object: {"product_match": bool, "template_product_absent": bool, "scene_match": bool, "reason": "<one short sentence>"}'
+            "Review image C. The TWO REQUIRED checks (any failure = REJECT):\n"
+            '1. "product_match": Does C clearly show OUR product (the one in A) — matching it in shape, color, handles, lid, branding?\n'
+            '2. "template_product_absent": Is the product from B (the original product in the scene template) ABSENT from C? '
+            "(true if only OUR product is visible; false if B's product is still in C, or if both products appear together)\n\n"
+            'Return ONLY a JSON object: {"product_match": bool, "template_product_absent": bool, "reason": "<one short sentence>"}'
         )
     else:
         instruction = (
@@ -770,7 +807,7 @@ def validate_atmosphere_image(
     try:
         data = json.loads(text)
         if scene_template_bytes:
-            ok = bool(data.get("product_match")) and bool(data.get("template_product_absent")) and bool(data.get("scene_match"))
+            ok = bool(data.get("product_match")) and bool(data.get("template_product_absent"))
         else:
             ok = bool(data.get("product_match")) and bool(data.get("professional_quality"))
         return {"ok": ok, "reason": data.get("reason", "")}
@@ -968,10 +1005,12 @@ def run_atmosphere_pipeline(
     if not gemini_client or not ref_bytes_list:
         return atmospheres_clean, atmospheres_striped
 
-    # ── Step 1: ingest scene templates + OCR taglines if user didn't type one
+    # ── Step 1: ingest scene templates — OCR strip text + ask Claude to describe the scene
+    # We deliberately keep the template image away from Gemini and pass only the text
+    # description, so Gemini has no original-product pixels to anchor on.
     scene_templates: list[dict] = []
     if scene_template_inputs:
-        with st.status("מעבד תמונות רפרנס...", expanded=False) as status:
+        with st.status("מעבד תמונות רפרנס...", expanded=True) as status:
             for idx, (ref_file, ref_tagline) in enumerate(scene_template_inputs):
                 if ref_file is None:
                     continue
@@ -985,7 +1024,7 @@ def run_atmosphere_pipeline(
 
                 effective_tagline = (ref_tagline or "").strip()
                 if not effective_tagline:
-                    status.update(label=f"קורא טקסט מהפס של רפרנס {idx+1}...")
+                    status.update(label=f"רפרנס {idx+1}: קורא טקסט מהפס...")
                     try:
                         ocr = extract_strip_text_from_reference(client, ref_bytes)
                         if ocr:
@@ -993,26 +1032,38 @@ def run_atmosphere_pipeline(
                     except Exception:
                         pass
 
-                scene_templates.append({"img_bytes": ref_bytes, "tagline": effective_tagline})
+                status.update(label=f"רפרנס {idx+1}: מנתח את הסצנה (לא את המוצר)...")
+                scene_desc = ""
+                try:
+                    scene_desc = describe_scene_for_replication(client, ref_bytes)
+                except Exception:
+                    pass
+
+                scene_templates.append({
+                    "img_bytes": ref_bytes,
+                    "tagline": effective_tagline,
+                    "scene_description": scene_desc,
+                })
             status.update(label=f"{len(scene_templates)} רפרנסים מוכנים", state="complete")
 
-    # ── Step 2: build generation tasks (always target_count)
+    # ── Step 2: build tasks — ONE image per template, then pad with generic atmospheres up to target_count
     tasks: list[dict] = []
-    if scene_templates:
-        n = len(scene_templates)
-        for i in range(target_count):
-            tpl = scene_templates[i % n]
-            tasks.append({"scene_template_bytes": tpl["img_bytes"], "tagline": tpl["tagline"]})
-    else:
-        for _ in range(target_count):
-            tasks.append({"scene_template_bytes": None, "tagline": ""})
+    for tpl in scene_templates:
+        tasks.append({
+            "scene_template_bytes": tpl["img_bytes"],     # for validator only
+            "scene_description": tpl["scene_description"],
+            "tagline": tpl["tagline"],
+        })
+    while len(tasks) < target_count:
+        tasks.append({"scene_template_bytes": None, "scene_description": "", "tagline": ""})
 
     # ── Step 3: generate (with optional validator + retry)
     user_taglines_per_atm: list[str] = []
     errors: list[str] = []
+    n_refs = len(scene_templates)
     intro = (
-        f"מייצר {target_count} תמונות אווירה ({len(scene_templates)} רפרנסים, מסבב ביניהם)..."
-        if scene_templates else
+        f"מייצר {target_count} תמונות אווירה ({n_refs} מבוססי רפרנס + {target_count - n_refs} גנריות)..."
+        if n_refs else
         f"מייצר {target_count} תמונות אווירה גנריות..."
     )
     with st.status(intro, expanded=True) as status:
@@ -1028,7 +1079,7 @@ def run_atmosphere_pipeline(
                 try:
                     last_atm = generate_atmosphere_image(
                         gemini_client, ref_bytes_list,
-                        scene_template_bytes=task["scene_template_bytes"],
+                        scene_description=task.get("scene_description") or None,
                         user_notes=user_notes,
                     )
                 except Exception as e:
@@ -1055,7 +1106,6 @@ def run_atmosphere_pipeline(
                 # else: retry
 
             if chosen_atm is None and last_atm is not None:
-                # All retries failed validation; keep the last attempt anyway and warn
                 chosen_atm = last_atm
                 if last_reason:
                     errors.append(f"תמונה {i+1}: עברה את כל הניסיונות אך הוולידטור התריע: {last_reason}")
@@ -1063,7 +1113,22 @@ def run_atmosphere_pipeline(
             if chosen_atm is not None:
                 atmospheres_clean.append(chosen_atm)
                 user_taglines_per_atm.append(task["tagline"])
-        status.update(label=f"נוצרו {len(atmospheres_clean)} תמונות אווירה", state="complete")
+
+        # Backfill: if any slot failed entirely, generate extra generics until we hit target_count
+        while len(atmospheres_clean) < target_count:
+            status.update(label=f"משלים — מייצר תמונה גנרית נוספת ({len(atmospheres_clean)+1}/{target_count})...")
+            try:
+                extra = generate_atmosphere_image(
+                    gemini_client, ref_bytes_list,
+                    scene_description=None, user_notes=user_notes,
+                )
+                atmospheres_clean.append(extra)
+                user_taglines_per_atm.append("")
+            except Exception as e:
+                errors.append(f"כשל בייצור תמונת השלמה: {type(e).__name__}: {e}")
+                break
+
+        status.update(label=f"נוצרו {len(atmospheres_clean)}/{target_count} תמונות אווירה", state="complete")
 
     for err in errors:
         st.warning(err)
@@ -1210,9 +1275,11 @@ with col1:
             )
             with st.expander("🎯 מצב 'תעשה לי כזה' — תמונות רפרנס כתבנית סצנה (אופציונלי)", expanded=False):
                 st.caption(
-                    "אפשר להעלות עד 4 תמונות רפרנס. כשמועלים פחות מ-4, האפליקציה תסבב ביניהן עד שמייצרת 4 תמונות סך הכל. "
-                    "אפשר לכתוב לכל תמונה משפט שיווקי משלך שיופיע על הפס. "
-                    "אם הרפרנס כבר מכיל פס שיווקי בעברית, האפליקציה תקרא ממנו את הטקסט אוטומטית (כשלא הקלדת אחד משלך). "
+                    "כל רפרנס שתעלה יהפוך לתמונת אווירה אחת בסצנה דומה — עם המוצר שלך מוחלף לתוכה. "
+                    "סך הכל ייוצרו תמיד 4 תמונות שונות: רפרנסים שהעלית + השלמה אוטומטית בתמונות אווירה גנריות עד 4. "
+                    "(למשל: 2 רפרנסים → 2 על בסיס סצנת רפרנס + 2 גנריות.) "
+                    "אפשר לכתוב לכל תמונה משפט שיווקי שיופיע על הפס. אם הרפרנס כבר מכיל פס שיווקי בעברית, "
+                    "האפליקציה תקרא ממנו את הטקסט אוטומטית (כשלא הקלדת אחד משלך). "
                     "אם תשאיר את כל הסלוטים ריקים — ייוצרו 4 תמונות אווירה גנריות עם משפטי שיווק אוטומטיים."
                 )
                 for i in range(4):
