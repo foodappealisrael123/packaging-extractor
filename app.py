@@ -317,36 +317,161 @@ MINIMAL_ATMOSPHERE_PROMPT = (
     "in a natural setting suitable for a premium e-commerce website."
 )
 
-# Distinct generic atmosphere "flavors" — assigned to generic slots so the user always
-# gets visually different generic atmospheres instead of four near-identical kitchen counters.
-GENERIC_SCENE_FLAVORS = [
-    (
-        "Bright modern kitchen counter scene. The product sits on a wooden cutting board with fresh seasonal "
-        "ingredients arranged loosely around it: cherry tomatoes on the vine, a sprig of rosemary, a few cloves "
-        "of garlic, a small ceramic dish of coarse salt, and a wooden spoon. White subway-tile splashback in the "
-        "soft-focus background. Warm late-morning light streaming from a window on the left. 3/4 angle, "
-        "eye-level, full-product shot occupying the lower-center of the frame, no hands visible."
-    ),
-    (
-        "Dramatic stovetop scene. The product is centered on a glass induction or gas stovetop with a soft burner "
-        "glow visible underneath, gentle steam rising from above. Dark moody kitchen background with brushed-steel "
-        "range hood and copper-toned utensils on a hanging rail, slightly out of focus. Slight 3/4 angle, "
-        "slightly above eye-level, product centered, cinematic side-lighting from the upper right."
-    ),
-    (
-        "Family dining table set for a meal. The product is the centerpiece on a rustic wooden dining table, "
-        "surrounded by a linen runner, two ceramic plates with neutral-toned napkins, simple water glasses, "
-        "a small vase of dried wheat. Warm golden afternoon light streaming through a large window in the "
-        "background, soft bokeh. Top-down angle slightly tilted, full-product shot."
-    ),
-    (
-        "Minimal premium kitchen island scene. The product sits alone, hero-style, on a clean white marble or "
-        "light oak countertop. A single styled prop nearby (a bunch of fresh thyme tied with twine, or a small "
-        "bowl of olive oil with a sprig of rosemary). Soft overhead diffused daylight, modern minimal background "
-        "with brushed-steel faucet softly out of focus. Eye-level angle, product front-and-center, e-commerce "
-        "studio-lifestyle aesthetic."
-    ),
-]
+# Distinct generic atmosphere "flavors" — assigned per slot so generic outputs are visually
+# different from each other. Organized by product category so plates aren't placed on a
+# stovetop, blenders aren't placed on a cutting board with rosemary, etc.
+GENERIC_SCENE_FLAVORS_BY_CATEGORY: dict[str, list[str]] = {
+    "cookware": [
+        (
+            "Bright modern kitchen counter scene. The product sits on a wooden cutting board with fresh seasonal "
+            "ingredients arranged loosely around it: cherry tomatoes on the vine, a sprig of rosemary, a few cloves "
+            "of garlic, a small ceramic dish of coarse salt, and a wooden spoon. White subway-tile splashback in the "
+            "soft-focus background. Warm late-morning light streaming from a window on the left. 3/4 angle, "
+            "eye-level, full-product shot occupying the lower-center of the frame, no hands visible."
+        ),
+        (
+            "Dramatic stovetop scene. The product is centered on a glass induction or gas stovetop with a soft burner "
+            "glow visible underneath, gentle steam rising from above. Dark moody kitchen background with brushed-steel "
+            "range hood and copper-toned utensils on a hanging rail, slightly out of focus. Slight 3/4 angle, "
+            "slightly above eye-level, product centered, cinematic side-lighting from the upper right."
+        ),
+        (
+            "Family dining table set for a meal. The product is the centerpiece on a rustic wooden dining table, "
+            "surrounded by a linen runner, two ceramic plates with neutral-toned napkins, simple water glasses, "
+            "a small vase of dried wheat. Warm golden afternoon light streaming through a large window in the "
+            "background, soft bokeh. Top-down angle slightly tilted, full-product shot."
+        ),
+        (
+            "Minimal premium kitchen island scene. The product sits alone, hero-style, on a clean white marble or "
+            "light oak countertop. A single styled prop nearby (a bunch of fresh thyme tied with twine, or a small "
+            "bowl of olive oil with a sprig of rosemary). Soft overhead diffused daylight, modern minimal background "
+            "with brushed-steel faucet softly out of focus. Eye-level angle, product front-and-center, e-commerce "
+            "studio-lifestyle aesthetic."
+        ),
+    ],
+    "tableware": [
+        (
+            "Beautifully set dining table place setting. The product is part of a styled place setting with polished "
+            "flatware (fork, knife, spoon as relevant) on a folded linen napkin, a water glass, and a small vase of "
+            "fresh wildflowers nearby. White linen tablecloth or light wood table. Soft warm afternoon light from a "
+            "window. 3/4 angle, slightly above eye-level, product in lower-center of frame."
+        ),
+        (
+            "Top-down flatlay tabletop scene. The product is arranged alongside matching flatware on a folded linen "
+            "napkin, with seasonal accents (half a lemon, a sprig of fresh basil, a small ramekin of olive oil). Light "
+            "wood or white-marble tabletop, soft overhead diffused daylight. Top-down angle, product centered or "
+            "slightly off-center, premium e-commerce aesthetic."
+        ),
+        (
+            "Premium hero shot. The product is shown on a soft linen cloth on a wooden surface, possibly with one "
+            "smaller matching piece nearby. A few stems of dried wheat or a sprig of fresh herbs add organic warmth. "
+            "Soft natural daylight from upper-left, gentle shadows. Eye-level, product front-and-center, e-commerce "
+            "product-page aesthetic."
+        ),
+        (
+            "Lifestyle scene of a styled meal. The product holds beautifully plated food appropriate to its shape "
+            "(a salad in a bowl, a main course on a plate, soup in a deep bowl, fruits in a serving piece, etc.), "
+            "with cutlery just outside the frame. Wooden table with a linen runner, golden afternoon light, soft "
+            "bokeh background. Slight 3/4 angle, eye-level."
+        ),
+    ],
+    "electrical_appliance": [
+        (
+            "Modern kitchen counter scene. The product sits on a clean white-marble or light-oak countertop, plugged "
+            "in with the power cord trailing to the right edge of the frame. Any visible display or LED indicator is "
+            "on and glowing softly. White subway-tile splashback or modern minimal cabinets in soft focus behind. "
+            "Warm morning light from a window on the left. 3/4 angle, eye-level, product front-and-center."
+        ),
+        (
+            "Active in-use scene appropriate to this appliance — steam rising from a kettle's spout, ingredients being "
+            "blended in a jug, bread popping up from a toaster, dough being mixed, etc. Relevant ingredients or props "
+            "on the counter (a mug ready beside a kettle, a chopping board with vegetables beside a food processor). "
+            "Modern kitchen background, soft side-lighting. Slight 3/4 angle, eye-level."
+        ),
+        (
+            "Premium product hero shot. The product sits alone on a clean white-marble countertop with a subtle styled "
+            "prop nearby (a small ceramic cup, a fresh herb sprig, or a folded linen towel). Soft overhead diffused "
+            "daylight, modern minimal background with brushed-steel fixtures softly out of focus. Eye-level, product "
+            "front-and-center, e-commerce hero aesthetic."
+        ),
+        (
+            "Bright family kitchen morning scene. The product is on a kitchen island as part of a casual morning setup "
+            "— a coffee mug nearby, a small plate with fresh fruit, a folded newspaper or kitchen towel. Soft natural "
+            "light streaming through a window in the background. 3/4 angle, slightly above eye-level."
+        ),
+    ],
+    "bakeware": [
+        (
+            "Lifestyle scene of a freshly-baked dessert. The product holds a completed golden-brown baked item "
+            "appropriate to its form (a cake, brownies, a tart, bread, muffins). Cooling on a wire rack on a wooden "
+            "countertop, with a tea towel and a light dusting of powdered sugar or scattered fresh berries nearby. "
+            "Warm afternoon light, 3/4 angle, eye-level."
+        ),
+        (
+            "Baking-in-progress kitchen scene. The product holds raw batter or shaped dough about to go into the oven; "
+            "a wooden spoon or whisk rests in or beside it; surrounding props include a mixing bowl, eggs, flour, "
+            "butter, vanilla pod. Light-colored countertop, warm window light. Slight 3/4 angle, slightly above eye-level."
+        ),
+        (
+            "Premium product hero shot. The product sits alone on a clean white-marble or light-oak countertop with a "
+            "small styled prop nearby (a sprig of herbs, a small bowl of flour, a vanilla pod). Soft overhead diffused "
+            "daylight. Eye-level, product front-and-center, e-commerce aesthetic."
+        ),
+        (
+            "Family dining table scene. The product is the centerpiece on a rustic wooden table, holding a completed "
+            "baked dessert ready to be served. Linen runner, ceramic plates around it, golden afternoon light streaming "
+            "from a window. Top-down angle slightly tilted."
+        ),
+    ],
+    "storage": [
+        (
+            "Organized pantry shelf scene. The product sits on a wooden or white shelf alongside complementary storage "
+            "items (jars, containers). Some pantry contents (pasta, grains, spices in clear jars) softly visible nearby. "
+            "Warm side-lighting from the left, 3/4 angle, eye-level, product as the focal point."
+        ),
+        (
+            "Kitchen counter scene with the product partially open or with its contents tastefully visible (e.g., flour, "
+            "cookies, snacks, fresh produce). A wooden spoon, a linen towel, or fresh fruit nearby for context. White "
+            "subway tile or marble counter, warm side-lighting, 3/4 angle, eye-level."
+        ),
+        (
+            "Premium product hero shot. The product sits alone on a clean white-marble or light-oak countertop with a "
+            "small styled prop nearby. Soft overhead diffused daylight, modern minimal background. Eye-level, product "
+            "front-and-center, e-commerce aesthetic."
+        ),
+        (
+            "Stacked-display scene. The product is shown stacked with one or two smaller items from the same line on "
+            "a clean light-wood or marble surface. Minimal styling (a sprig of herbs, a folded linen). Soft overhead "
+            "diffused daylight. Eye-level."
+        ),
+    ],
+    # Generic fallback — works for kitchen accessories / utensils / anything that doesn't fit a more specific category
+    "other": [
+        (
+            "Clean kitchen counter scene. The product is the focus of the frame on a light-wood or white-marble "
+            "countertop, with one or two relevant lifestyle props nearby. White subway-tile splashback in soft focus "
+            "behind. Warm late-morning light from a window on the left. 3/4 angle, eye-level."
+        ),
+        (
+            "Active use scene. The product is being used in its natural way — held in a hand, paired with the items "
+            "it normally accompanies, in mid-action. Modern kitchen background, soft side-lighting, 3/4 angle, "
+            "eye-level."
+        ),
+        (
+            "Premium product hero shot. The product sits alone on a clean white-marble countertop with a subtle styled "
+            "prop nearby. Soft overhead diffused daylight, modern minimal background with brushed-steel fixtures "
+            "softly out of focus. Eye-level, product front-and-center, e-commerce hero aesthetic."
+        ),
+        (
+            "Bright family kitchen scene. The product is part of a casual everyday kitchen setup with relevant props "
+            "(towels, a small plate, fresh fruit, a folded paper). Soft natural light through a window in the "
+            "background. 3/4 angle, slightly above eye-level."
+        ),
+    ],
+}
+
+# Backward-compat alias — code that still references GENERIC_SCENE_FLAVORS gets the cookware list.
+GENERIC_SCENE_FLAVORS = GENERIC_SCENE_FLAVORS_BY_CATEGORY["cookware"]
 
 
 FALLBACK_TAGLINES = [
@@ -573,6 +698,46 @@ def extract_marketing_taglines(client: anthropic.Anthropic, hebrew_content: str)
         if text.startswith("json"):
             text = text[4:].strip()
     return json.loads(text)
+
+
+def detect_product_category(client: anthropic.Anthropic, product_img_bytes_list: list[bytes]) -> str:
+    """Classify the product into one of the categories that have curated generic-scene flavors.
+    Returns one of: 'cookware', 'tableware', 'electrical_appliance', 'bakeware', 'storage', 'other'."""
+    valid = {"cookware", "tableware", "electrical_appliance", "bakeware", "storage", "other"}
+    if not product_img_bytes_list:
+        return "other"
+    img = Image.open(io.BytesIO(product_img_bytes_list[0])).convert("RGB")
+    if max(img.size) > 800:
+        ratio = 800 / max(img.size)
+        img = img.resize((int(img.width * ratio), int(img.height * ratio)), Image.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=82)
+    b64 = base64.standard_b64encode(buf.getvalue()).decode()
+
+    msg = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=20,
+        messages=[{
+            "role": "user",
+            "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}},
+                {"type": "text", "text": (
+                    "Classify this kitchen product into ONE of these categories. Reply with EXACTLY one word — "
+                    "the category name in lowercase, nothing else.\n\n"
+                    "- cookware — pots, pans, woks, saucepans, sauté pans (used directly on heat to cook)\n"
+                    "- tableware — plates, bowls, serving dishes, mugs, cups (for serving / eating, not cooking)\n"
+                    "- electrical_appliance — kettles, blenders, toasters, mixers, food processors, air fryers, "
+                    "coffee makers (anything that plugs in)\n"
+                    "- bakeware — cake tins, muffin trays, baking sheets, loaf pans, pie dishes (used in the oven)\n"
+                    "- storage — food storage containers, jars, lunch boxes, canisters\n"
+                    "- other — kitchen accessories, utensils, knives, cutting boards, anything that doesn't fit above"
+                )},
+            ],
+        }],
+    )
+    cat = msg.content[0].text.strip().lower().split()[0] if msg.content[0].text.strip() else "other"
+    cat = cat.strip(".,;:'\"")
+    return cat if cat in valid else "other"
 
 
 def describe_product_invariants(client: anthropic.Anthropic, product_img_bytes_list: list[bytes]) -> str:
@@ -1202,17 +1367,34 @@ def run_atmosphere_pipeline(
     if not gemini_client or not ref_bytes_list:
         return atmospheres_clean, atmospheres_striped
 
-    # ── Step 0: extract product invariants (handle count, lid type, color, etc.) ONCE.
-    # These get injected into every Gemini prompt so the model can't hallucinate (e.g.,
-    # 3 handles instead of 2, transparent lid instead of opaque).
+    # ── Step 0: classify the product + extract invariants ONCE.
+    # The category picks the right set of generic atmosphere scenes (so plates aren't
+    # placed on stovetops, blenders aren't placed on cutting boards, etc.).
+    # The invariants get injected into every Gemini prompt so the model can't hallucinate
+    # (extra handles, transparent lid instead of opaque, etc.).
     product_invariants = ""
-    with st.status("סורק את המוצר ומחלץ עובדות שאסור לשנות (ידיות, מכסה, צבע)...", expanded=False) as status:
+    product_category = "other"
+    with st.status("סורק את המוצר: מסווג קטגוריה ומחלץ עובדות שאסור לשנות...", expanded=False) as status:
+        try:
+            product_category = detect_product_category(client, ref_bytes_list)
+        except Exception:
+            product_category = "other"
         try:
             product_invariants = describe_product_invariants(client, ref_bytes_list)
         except Exception as e:
-            errors_init = f"לא הצלחתי לחלץ עובדות מוצר ({type(e).__name__}); ממשיך בלי. {e}"
-            st.info(errors_init)
-        status.update(label="עובדות המוצר חולצו" if product_invariants else "ללא עובדות מוצר", state="complete")
+            st.info(f"לא הצלחתי לחלץ עובדות מוצר ({type(e).__name__}); ממשיך בלי. {e}")
+        category_he = {
+            "cookware": "כלי בישול",
+            "tableware": "כלי הגשה (צלחות/קעריות)",
+            "electrical_appliance": "מוצר חשמלי",
+            "bakeware": "כלי אפיה",
+            "storage": "כלי איחסון",
+            "other": "אחר/אביזרים",
+        }.get(product_category, product_category)
+        status.update(label=f"זוהה: {category_he}. עובדות מוצר חולצו." if product_invariants else f"זוהה: {category_he}.", state="complete")
+
+    # Pick the curated generic-scene flavors for this product category
+    flavors_for_this_product = GENERIC_SCENE_FLAVORS_BY_CATEGORY.get(product_category, GENERIC_SCENE_FLAVORS_BY_CATEGORY["other"])
 
     # ── Step 1: ingest scene templates — OCR strip text + ask Claude to describe the scene
     # We deliberately keep the template image away from Gemini and pass only the text
@@ -1281,7 +1463,7 @@ def run_atmosphere_pipeline(
     flavor_idx = 0
     for task in tasks:
         if task["is_generic"]:
-            task["scene_description"] = GENERIC_SCENE_FLAVORS[flavor_idx % len(GENERIC_SCENE_FLAVORS)]
+            task["scene_description"] = flavors_for_this_product[flavor_idx % len(flavors_for_this_product)]
             flavor_idx += 1
 
     # ── Step 3: generate (with optional validator + retry)
@@ -1347,7 +1529,7 @@ def run_atmosphere_pipeline(
             status.update(label=f"משלים — מייצר תמונה גנרית נוספת ({len(atmospheres_clean)+1}/{target_count})...")
             try:
                 # Pick a different flavor than what's already been used to keep variety
-                fallback_flavor = GENERIC_SCENE_FLAVORS[len(atmospheres_clean) % len(GENERIC_SCENE_FLAVORS)]
+                fallback_flavor = flavors_for_this_product[len(atmospheres_clean) % len(flavors_for_this_product)]
                 extra = generate_atmosphere_image(
                     gemini_client, ref_bytes_list,
                     scene_description=fallback_flavor,
