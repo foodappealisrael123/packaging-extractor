@@ -625,9 +625,9 @@ def describe_product_invariants(client: anthropic.Anthropic, product_img_bytes_l
 def describe_scene_for_replication(client: anthropic.Anthropic, template_bytes: bytes) -> str:
     """Use Claude Vision to write a detailed text description of the reference scene
     (setting, camera, lighting, props, product position, framing scale, functional state)
-    WITHOUT describing the product's appearance. Returns the description, or the literal
-    word 'STUDIO_SHOT' if the reference is just a plain product photo on a neutral
-    background (not a real lifestyle scene)."""
+    WITHOUT describing the product's appearance. Always returns a description — even for
+    studio shots, where it captures the framing/angle so we can reproduce that look with
+    OUR product instead of dropping the reference."""
     img = Image.open(io.BytesIO(template_bytes)).convert("RGB")
     if max(img.size) > 1024:
         ratio = 1024 / max(img.size)
@@ -644,11 +644,9 @@ def describe_scene_for_replication(client: anthropic.Anthropic, template_bytes: 
             "content": [
                 {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}},
                 {"type": "text", "text": (
-                    "I will use your description to ask an image-generation model to recreate this exact SCENE with a different product placed in it.\n\n"
-                    "FIRST — STUDIO-SHOT CHECK:\n"
-                    "If this image is just a plain product photo on a neutral white/grey/black background with no real-world setting "
-                    "(no kitchen, no surface details, no props, no hands, no environment) — reply with ONLY the single literal word: STUDIO_SHOT\n"
-                    "Otherwise, write a single dense English paragraph (5-10 sentences) covering ALL of the following.\n\n"
+                    "I will use your description to ask an image-generation model to recreate this exact look with a different product placed in it. "
+                    "Always write a description — even for plain studio shots, capture the framing/angle/lighting so we can reproduce that look. "
+                    "Write a single dense English paragraph (5-10 sentences) covering ALL of the following.\n\n"
                     "REQUIRED ASPECTS — every paragraph MUST address each of these explicitly:\n\n"
                     "1. FRAMING SCALE — explicitly state one of: 'wide environmental shot', 'full-product shot', 'half-product shot', "
                     "'partial close-up showing [which part]', 'extreme close-up filling the frame with just [which part of the product]'. "
@@ -657,19 +655,20 @@ def describe_scene_for_replication(client: anthropic.Anthropic, template_bytes: 
                     "drawer pulled out, etc.)? Is it being actively used — tilted, held, poured, washed, cooked in, filled with water, "
                     "filled with food, steaming, etc.? If a normally-present part is NOT visible (e.g., the lid is not in frame, "
                     "the handle isn't shown), say so explicitly: 'the [part] is not visible / has been removed / is not in the frame'.\n\n"
-                    "3. SETTING — kitchen counter, dining table, stovetop, sink, cutting board, etc. + all visible background "
-                    "elements (cabinets, soap dispenser, dish rack, window, tiles, plants, faucet, splashback, etc.).\n\n"
+                    "3. SETTING / BACKGROUND — kitchen counter, dining table, stovetop, sink, cutting board, etc. — OR if it's a "
+                    "studio-style shot, describe it as 'plain white/grey/black studio background, [no-prop / minimalist] presentation' "
+                    "and capture any subtle backdrop details (gradient, soft shadow, reflection on surface).\n\n"
                     "4. CAMERA — angle, perspective, distance: top-down / 3/4 / eye-level / low-angle / etc.\n\n"
                     "5. LIGHTING — style and direction: warm morning side-light from left / soft overhead diffused / golden hour / "
                     "studio softbox / cool window light / etc.\n\n"
-                    "6. PROPS, FOOD, HANDS, WATER, STEAM — every visible non-product element in the frame.\n\n"
+                    "6. PROPS, FOOD, HANDS, WATER, STEAM — every visible non-product element in the frame (or 'no props' for studio).\n\n"
                     "7. PRODUCT POSITION IN FRAME — centered? lower-third? cropped at edge? what percentage of the frame does it occupy? "
                     "what orientation (front-facing, 3/4 turned, side, top-down)?\n\n"
                     "STRICT RULES:\n"
                     "- DO NOT describe the product's appearance (color, material, brand, decorative style). Refer to it as 'the product' only.\n"
                     "  Do describe its STATE (open/closed/in-use) and POSITION/SCALE — those are about the scene, not the product's looks.\n"
                     "- DO NOT mention any text, banners, marketing strips, logos, captions, or overlays in the image — pretend they don't exist.\n"
-                    "- Output ONLY the paragraph (or STUDIO_SHOT). No preface, no bullets, no markdown."
+                    "- Output ONLY the paragraph. No preface, no bullets, no markdown."
                 )},
             ],
         }],
@@ -906,13 +905,9 @@ def extract_strip_text_from_reference(client: anthropic.Anthropic, ref_bytes: by
         text = out or text[:60]
     if _looks_like_gibberish(text):
         return ""
-    # Second pass: verify the OCR'd text is grammatical, correctly-spelled Hebrew.
-    # Catches subtle letter-swap OCR errors that the heuristic gibberish check misses.
-    try:
-        if not _verify_hebrew_text_clean(client, text):
-            return ""
-    except Exception:
-        pass  # If verifier fails, fall through and accept the text as-is
+    # No verify pass — the user explicitly wants OCR text from references to come through.
+    # Trust the OCR; the gibberish heuristic above catches obvious failures. If specific
+    # OCR errors slip through, the user can override with a manually-typed tagline.
     return text
 
 
@@ -1222,28 +1217,19 @@ def run_atmosphere_pipeline(
                 except Exception:
                     pass
 
-                is_studio_shot = scene_desc.strip().upper() == "STUDIO_SHOT"
-                if is_studio_shot:
-                    st.info(
-                        f"רפרנס {idx+1} מזוהה כתמונת סטודיו (מוצר על רקע אחיד) ולא כסצנת אווירה. "
-                        "אהפוך אותו לסלוט גנרי — תיווצר תמונת אווירה אמיתית במקומו."
-                    )
-
                 scene_templates.append({
                     "img_bytes": ref_bytes,
                     "tagline": effective_tagline,
-                    "scene_description": "" if is_studio_shot else scene_desc,
-                    "is_studio_shot": is_studio_shot,
+                    "scene_description": scene_desc,
                 })
             status.update(label=f"{len(scene_templates)} רפרנסים מוכנים", state="complete")
 
-    # ── Step 2: build tasks — ONE image per non-studio template, then pad with DIFFERENT
-    # generic-flavor scenes (so generic slots produce visually distinct outputs, not 4 of
-    # the same kitchen counter).
+    # ── Step 2: build tasks — ONE image per uploaded reference (always honored), then pad
+    # any remaining slots with DIFFERENT generic-flavor scenes for variety.
     tasks: list[dict] = []
     for tpl in scene_templates:
-        if tpl["is_studio_shot"] or not tpl["scene_description"]:
-            # Studio shot or failed description → mark as generic slot but keep user's tagline
+        if not tpl["scene_description"]:
+            # Description failed → fall back to a generic flavor but keep user's tagline
             tasks.append({
                 "scene_template_bytes": None,
                 "scene_description": None,    # filled later from GENERIC_SCENE_FLAVORS
