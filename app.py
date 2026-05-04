@@ -547,9 +547,10 @@ def extract_marketing_taglines(client: anthropic.Anthropic, hebrew_content: str)
 
 def describe_scene_for_replication(client: anthropic.Anthropic, template_bytes: bytes) -> str:
     """Use Claude Vision to write a detailed text description of the reference scene
-    (setting, camera, lighting, props, product position) WITHOUT describing the product itself.
-    The description is what we send to Gemini instead of the template image, so Gemini has
-    no original-product pixels to anchor on and is forced to render OUR product into the scene."""
+    (setting, camera, lighting, props, product position, framing scale, functional state)
+    WITHOUT describing the product's appearance. Returns the description, or the literal
+    word 'STUDIO_SHOT' if the reference is just a plain product photo on a neutral
+    background (not a real lifestyle scene)."""
     img = Image.open(io.BytesIO(template_bytes)).convert("RGB")
     if max(img.size) > 1024:
         ratio = 1024 / max(img.size)
@@ -560,31 +561,72 @@ def describe_scene_for_replication(client: anthropic.Anthropic, template_bytes: 
 
     msg = client.messages.create(
         model="claude-sonnet-4-20250514",
-        max_tokens=700,
+        max_tokens=900,
         messages=[{
             "role": "user",
             "content": [
                 {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}},
                 {"type": "text", "text": (
-                    "I will use your description to ask an image-generation model to recreate this exact SCENE with a different product placed in it. "
-                    "Write a single dense English paragraph (4-7 sentences) describing the scene in enough visual detail to faithfully reproduce it.\n\n"
-                    "Cover all of these:\n"
-                    "- Setting / environment / room / surface (kitchen counter, dining table, stovetop, sink, garden, etc.)\n"
-                    "- All visible background elements (cabinets, soap dispenser, dish rack, window, tiles, plants, etc.)\n"
-                    "- Camera angle, framing, perspective, distance (3/4 angle, top-down, eye-level close-up, wide, etc.)\n"
-                    "- Lighting style and direction (warm morning light from left, soft overhead diffused, golden hour, studio lighting, etc.)\n"
-                    "- Mood, color palette, time of day\n"
-                    "- All props, food, garnishes, utensils, hands, body parts, water, steam, splashes, etc. — everything in the frame EXCEPT the main product\n"
-                    "- Where in the frame the main product sits, at what scale relative to the frame, and in what orientation (e.g., 'centered in lower third, occupies 40% of frame width, viewed from 3/4 front, slightly tilted right')\n\n"
+                    "I will use your description to ask an image-generation model to recreate this exact SCENE with a different product placed in it.\n\n"
+                    "FIRST — STUDIO-SHOT CHECK:\n"
+                    "If this image is just a plain product photo on a neutral white/grey/black background with no real-world setting "
+                    "(no kitchen, no surface details, no props, no hands, no environment) — reply with ONLY the single literal word: STUDIO_SHOT\n"
+                    "Otherwise, write a single dense English paragraph (5-10 sentences) covering ALL of the following.\n\n"
+                    "REQUIRED ASPECTS — every paragraph MUST address each of these explicitly:\n\n"
+                    "1. FRAMING SCALE — explicitly state one of: 'wide environmental shot', 'full-product shot', 'half-product shot', "
+                    "'partial close-up showing [which part]', 'extreme close-up filling the frame with just [which part of the product]'. "
+                    "If a specific part of the product is featured (handle, lid, rim, base, knob, side wall), name it.\n\n"
+                    "2. FUNCTIONAL / USE STATE — describe explicitly: is the product OPEN or CLOSED (e.g., lid off vs lid on, "
+                    "drawer pulled out, etc.)? Is it being actively used — tilted, held, poured, washed, cooked in, filled with water, "
+                    "filled with food, steaming, etc.? If a normally-present part is NOT visible (e.g., the lid is not in frame, "
+                    "the handle isn't shown), say so explicitly: 'the [part] is not visible / has been removed / is not in the frame'.\n\n"
+                    "3. SETTING — kitchen counter, dining table, stovetop, sink, cutting board, etc. + all visible background "
+                    "elements (cabinets, soap dispenser, dish rack, window, tiles, plants, faucet, splashback, etc.).\n\n"
+                    "4. CAMERA — angle, perspective, distance: top-down / 3/4 / eye-level / low-angle / etc.\n\n"
+                    "5. LIGHTING — style and direction: warm morning side-light from left / soft overhead diffused / golden hour / "
+                    "studio softbox / cool window light / etc.\n\n"
+                    "6. PROPS, FOOD, HANDS, WATER, STEAM — every visible non-product element in the frame.\n\n"
+                    "7. PRODUCT POSITION IN FRAME — centered? lower-third? cropped at edge? what percentage of the frame does it occupy? "
+                    "what orientation (front-facing, 3/4 turned, side, top-down)?\n\n"
                     "STRICT RULES:\n"
-                    "- DO NOT describe the product itself (don't mention its color, material, brand, type, shape). Treat it as a generic 'product'.\n"
-                    "- DO NOT mention any text, banners, marketing strips, logos, captions, or overlays visible on the image — even if there are some. Pretend they don't exist.\n"
-                    "- Output ONLY the paragraph. No preface, no bullets, no markdown."
+                    "- DO NOT describe the product's appearance (color, material, brand, decorative style). Refer to it as 'the product' only.\n"
+                    "  Do describe its STATE (open/closed/in-use) and POSITION/SCALE — those are about the scene, not the product's looks.\n"
+                    "- DO NOT mention any text, banners, marketing strips, logos, captions, or overlays in the image — pretend they don't exist.\n"
+                    "- Output ONLY the paragraph (or STUDIO_SHOT). No preface, no bullets, no markdown."
                 )},
             ],
         }],
     )
     return msg.content[0].text.strip()
+
+
+def _verify_hebrew_text_clean(client: anthropic.Anthropic, text: str) -> bool:
+    """Ask Claude whether a given Hebrew string is grammatical, correctly-spelled, and coherent.
+    Used as a second pass on OCR'd strip text to filter out garbled OCR results.
+    Returns True only if Claude is confident the text is clean."""
+    if not text or len(text) < 3:
+        return False
+    msg = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=10,
+        messages=[{
+            "role": "user",
+            "content": [{
+                "type": "text",
+                "text": (
+                    f"Hebrew text to verify:\n«{text}»\n\n"
+                    "Check ALL of these:\n"
+                    "1. Every word is correctly spelled (no letter swaps, no typos).\n"
+                    "2. The grammar is valid Hebrew.\n"
+                    "3. The phrase is coherent and makes sense as marketing/product copy.\n\n"
+                    "Reply with EXACTLY one word, no punctuation, no explanation:\n"
+                    "- YES if all three checks pass with high confidence\n"
+                    "- NO if anything is misspelled, ungrammatical, or incoherent (even slightly)"
+                ),
+            }],
+        }],
+    )
+    return msg.content[0].text.strip().upper().startswith("Y")
 
 
 def generate_atmosphere_image(
@@ -608,10 +650,23 @@ def generate_atmosphere_image(
     if scene_description:
         full_prompt = (
             PRODUCT_PRESERVATION_RULES + "\n\n"
-            f"The {len(product_imgs)} reference images show OUR PRODUCT. Preserve it pixel-accurately in your output: "
-            "same exact shape, color, handles, lid, proportions, branding, surface finish.\n\n"
+            f"The {len(product_imgs)} reference images show OUR PRODUCT. Preserve its IDENTITY pixel-accurately: "
+            "same exact shape, color, handles, lid design, proportions, branding, material, surface finish.\n\n"
             "Place OUR product into the following scene, exactly as described:\n\n"
             f"=== SCENE TO RENDER ===\n{scene_description}\n=== END SCENE ===\n\n"
+            "## Critical: scene state overrides reference-photo state\n"
+            "The product reference photos show the product in a generic neutral state (e.g., closed, lid on, on a "
+            "white background, full view). The SCENE description above may require the product in a DIFFERENT state — "
+            "e.g., lid removed, tilted, viewed from a specific angle, framed as an extreme close-up of one part, "
+            "actively being used, filled with water/food, with steam, etc. WHEN THE SCENE STATE DIFFERS FROM THE "
+            "PHOTOS, FOLLOW THE SCENE STATE. Render OUR product in the state the scene describes:\n"
+            "- If the scene says 'the lid is removed and not in the frame' → render the open product body, no lid visible.\n"
+            "- If the scene says 'extreme close-up of the right handle' → render only that handle filling the frame, "
+            "with the rest of the product cropped out.\n"
+            "- If the scene says 'tilted forward pouring liquid' → render OUR product tilted that way.\n"
+            "What must stay constant from the reference photos: identity (which product it is — same shape, color, "
+            "handles, branding). What must follow the scene description: state, framing, scale, orientation, position.\n\n"
+            "## Output requirements\n"
             "Render this scene as a high-quality, professional, photorealistic lifestyle photograph for an "
             "e-commerce product page. The ONLY product visible in your output is OUR product (from the reference images). "
             "Do not invent any other product, kitchenware item, or object that resembles a separate product. "
@@ -742,6 +797,13 @@ def extract_strip_text_from_reference(client: anthropic.Anthropic, ref_bytes: by
         text = out or text[:60]
     if _looks_like_gibberish(text):
         return ""
+    # Second pass: verify the OCR'd text is grammatical, correctly-spelled Hebrew.
+    # Catches subtle letter-swap OCR errors that the heuristic gibberish check misses.
+    try:
+        if not _verify_hebrew_text_clean(client, text):
+            return ""
+    except Exception:
+        pass  # If verifier fails, fall through and accept the text as-is
     return text
 
 
@@ -1032,28 +1094,44 @@ def run_atmosphere_pipeline(
                     except Exception:
                         pass
 
-                status.update(label=f"רפרנס {idx+1}: מנתח את הסצנה (לא את המוצר)...")
+                status.update(label=f"רפרנס {idx+1}: מנתח את הסצנה (מסגור, מצב המוצר, פרטי השימוש)...")
                 scene_desc = ""
                 try:
                     scene_desc = describe_scene_for_replication(client, ref_bytes)
                 except Exception:
                     pass
 
+                is_studio_shot = scene_desc.strip().upper() == "STUDIO_SHOT"
+                if is_studio_shot:
+                    st.info(
+                        f"רפרנס {idx+1} מזוהה כתמונת סטודיו (מוצר על רקע אחיד) ולא כסצנת אווירה. "
+                        "אהפוך אותו לסלוט גנרי — תיווצר תמונת אווירה אמיתית במקומו."
+                    )
+
                 scene_templates.append({
                     "img_bytes": ref_bytes,
                     "tagline": effective_tagline,
-                    "scene_description": scene_desc,
+                    "scene_description": "" if is_studio_shot else scene_desc,
+                    "is_studio_shot": is_studio_shot,
                 })
             status.update(label=f"{len(scene_templates)} רפרנסים מוכנים", state="complete")
 
-    # ── Step 2: build tasks — ONE image per template, then pad with generic atmospheres up to target_count
+    # ── Step 2: build tasks — ONE image per non-studio template, then pad with generic atmospheres up to target_count
     tasks: list[dict] = []
     for tpl in scene_templates:
-        tasks.append({
-            "scene_template_bytes": tpl["img_bytes"],     # for validator only
-            "scene_description": tpl["scene_description"],
-            "tagline": tpl["tagline"],
-        })
+        if tpl["is_studio_shot"] or not tpl["scene_description"]:
+            # Studio shot or failed description → treat as a generic slot (still keeps user's tagline)
+            tasks.append({
+                "scene_template_bytes": None,
+                "scene_description": "",
+                "tagline": tpl["tagline"],
+            })
+        else:
+            tasks.append({
+                "scene_template_bytes": tpl["img_bytes"],     # for validator only
+                "scene_description": tpl["scene_description"],
+                "tagline": tpl["tagline"],
+            })
     while len(tasks) < target_count:
         tasks.append({"scene_template_bytes": None, "scene_description": "", "tagline": ""})
 
