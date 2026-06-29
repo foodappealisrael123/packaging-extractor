@@ -412,10 +412,14 @@ with col1:
             horizontal=True,
         )
 
-        if upload_mode == "PDF של אריזה":
-            remove_bg = st.checkbox("הסרת רקע (רקע שקוף)")
-        else:
-            remove_bg = False
+        bg_choice = st.radio(
+            "רקע התמונות",
+            options=["רקע לבן", "רקע שקוף"],
+            index=0,
+            horizontal=True,
+            help="לבן = הרקע המקורי מה-PDF (בדר\"כ לבן). שקוף = הסרת רקע אוטומטית והוצאת PNG עם שקיפות.",
+        )
+        remove_bg = bg_choice == "רקע שקוף"
 
         run_btn = st.button("🚀 עבד", use_container_width=True)
     else:
@@ -455,6 +459,15 @@ if run_btn and uploaded:
                         images.append({"bytes": resized, "width": pil.width, "height": pil.height, "xref": i})
                     status.update(label=f"{len(images)} תמונות מעובדות", state="complete")
 
+                bg_removed = False
+                if remove_bg:
+                    with st.status("מסיר רקע מתמונות...", expanded=True) as status:
+                        for i, img in enumerate(images):
+                            img["bytes"] = remove_background(img["bytes"])
+                            status.update(label=f"מסיר רקע... ({i+1}/{len(images)})")
+                        bg_removed = True
+                        status.update(label="רקע הוסר בהצלחה!", state="complete")
+
                 hebrew_content = ""
                 if not skip_hebrew:
                     with st.status(f"מייצר תוכן שיווקי ({text_style}) בעברית מכל התמונות...", expanded=True) as status:
@@ -462,7 +475,6 @@ if run_btn and uploaded:
                         status.update(label="תוכן שיווקי מוכן!", state="complete")
 
                 packaging_text = ""
-                bg_removed = False
 
             st.session_state["results"] = {
                 "images": images,
