@@ -180,7 +180,7 @@ def extract_packaging_text(client: anthropic.Anthropic, page_jpegs: list[bytes])
         "Return structured plain text, combining text from all images into one coherent document."
     )})
     msg = client.messages.create(
-        model="claude-sonnet-4-20250514",
+        model="claude-sonnet-4-6",
         max_tokens=2000,
         messages=[{"role": "user", "content": content}],
     )
@@ -205,7 +205,7 @@ def generate_hebrew_content(client: anthropic.Anthropic, packaging_text: str, st
         prompt = MARKETING_TEMPLATE.format(packaging_text=packaging_text)
 
     msg = client.messages.create(
-        model="claude-sonnet-4-20250514",
+        model="claude-sonnet-4-6",
         max_tokens=2000,
         messages=[{"role": "user", "content": prompt}],
     )
@@ -250,7 +250,7 @@ def is_product_image(client: anthropic.Anthropic, img_bytes: bytes) -> bool:
     b64 = base64.standard_b64encode(buf.getvalue()).decode()
 
     msg = client.messages.create(
-        model="claude-sonnet-4-20250514",
+        model="claude-sonnet-4-6",
         max_tokens=50,
         messages=[{
             "role": "user",
@@ -312,7 +312,7 @@ def generate_hebrew_from_images(client: anthropic.Anthropic, img_bytes_list: lis
     content_blocks.append({"type": "text", "text": instruction})
 
     msg = client.messages.create(
-        model="claude-sonnet-4-20250514",
+        model="claude-sonnet-4-6",
         max_tokens=2000 if style == "long" else 800,
         messages=[{"role": "user", "content": content_blocks}],
     )
