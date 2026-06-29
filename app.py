@@ -237,6 +237,19 @@ def remove_background(img_bytes: bytes) -> bytes:
     return remove(img_bytes)
 
 
+def remove_background_to_white(img_bytes: bytes) -> bytes:
+    """Remove background and composite the product onto a clean white canvas.
+    Returns JPG bytes."""
+    from rembg import remove
+    no_bg = remove(img_bytes)
+    fg = Image.open(io.BytesIO(no_bg)).convert("RGBA")
+    white = Image.new("RGB", fg.size, (255, 255, 255))
+    white.paste(fg, mask=fg.split()[3])
+    buf = io.BytesIO()
+    white.save(buf, format="JPEG", quality=95)
+    return buf.getvalue()
+
+
 def is_product_image(client: anthropic.Anthropic, img_bytes: bytes) -> bool:
     """Use Claude Vision to decide if an image is a clean product shot worth keeping.
     Filters out: designer PSD mockups, instructional diagrams, small logos/icons,
@@ -417,15 +430,15 @@ with col1:
             options=["רקע לבן", "רקע שקוף"],
             index=0,
             horizontal=True,
-            help="לבן = הרקע המקורי מה-PDF (בדר\"כ לבן). שקוף = הסרת רקע אוטומטית והוצאת PNG עם שקיפות.",
+            help="בשתי האופציות הרקע המקורי מוסר אוטומטית. לבן = המוצר על קנבס לבן נקי (JPG). שקוף = המוצר עם שקיפות (PNG).",
         )
-        remove_bg = bg_choice == "רקע שקוף"
+        transparent_output = bg_choice == "רקע שקוף"
 
         run_btn = st.button("🚀 עבד", use_container_width=True)
     else:
         run_btn = False
         text_style = "ארוך ומפורט"
-        remove_bg = False
+        transparent_output = False
         st.info("📂 ממתין לקובץ...")
     st.markdown('</div>', unsafe_allow_html=True)
 
@@ -459,14 +472,16 @@ if run_btn and uploaded:
                         images.append({"bytes": resized, "width": pil.width, "height": pil.height, "xref": i})
                     status.update(label=f"{len(images)} תמונות מעובדות", state="complete")
 
-                bg_removed = False
-                if remove_bg:
-                    with st.status("מסיר רקע מתמונות...", expanded=True) as status:
-                        for i, img in enumerate(images):
+                bg_label = "רקע שקוף (PNG)" if transparent_output else "רקע לבן נקי (JPG)"
+                with st.status(f"מסיר רקע מקורי ומכין תמונות עם {bg_label}...", expanded=True) as status:
+                    for i, img in enumerate(images):
+                        if transparent_output:
                             img["bytes"] = remove_background(img["bytes"])
-                            status.update(label=f"מסיר רקע... ({i+1}/{len(images)})")
-                        bg_removed = True
-                        status.update(label="רקע הוסר בהצלחה!", state="complete")
+                        else:
+                            img["bytes"] = remove_background_to_white(img["bytes"])
+                        status.update(label=f"מעבד תמונה {i+1}/{len(images)}...")
+                    status.update(label=f"רקע {bg_label} הוחל בהצלחה!", state="complete")
+                bg_removed = transparent_output
 
                 hebrew_content = ""
                 if not skip_hebrew:
@@ -508,14 +523,16 @@ if run_btn and uploaded:
                         img["width"], img["height"] = pil.width, pil.height
                     status.update(label=f"{len(images)} תמונות מוצר איכותיות (סוננו {len(raw_images)-len(images)})", state="complete")
 
-                bg_removed = False
-                if remove_bg:
-                    with st.status("מסיר רקע מתמונות...", expanded=True) as status:
-                        for i, img in enumerate(images):
+                bg_label = "רקע שקוף (PNG)" if transparent_output else "רקע לבן נקי (JPG)"
+                with st.status(f"מסיר רקע מקורי ומכין תמונות עם {bg_label}...", expanded=True) as status:
+                    for i, img in enumerate(images):
+                        if transparent_output:
                             img["bytes"] = remove_background(img["bytes"])
-                            status.update(label=f"מסיר רקע... ({i+1}/{len(images)})")
-                        bg_removed = True
-                        status.update(label="רקע הוסר בהצלחה!", state="complete")
+                        else:
+                            img["bytes"] = remove_background_to_white(img["bytes"])
+                        status.update(label=f"מעבד תמונה {i+1}/{len(images)}...")
+                    status.update(label=f"רקע {bg_label} הוחל בהצלחה!", state="complete")
+                bg_removed = transparent_output
 
                 packaging_text = ""
                 hebrew_content = ""
