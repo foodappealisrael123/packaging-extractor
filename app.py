@@ -320,11 +320,12 @@ def generate_hebrew_from_images(client: anthropic.Anthropic, img_bytes_list: lis
 
 
 def create_zip(images: list[dict], hebrew_text: str, bg_removed: bool = False) -> bytes:
-    """Pack product images + Hebrew text file into a ZIP."""
+    """Pack product images + (optional) Hebrew text file into a ZIP."""
     ext = "png" if bg_removed else "jpg"
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("marketing_content_he.txt", hebrew_text.encode("utf-8"))
+        if hebrew_text:
+            zf.writestr("marketing_content_he.txt", hebrew_text.encode("utf-8"))
         for i, img in enumerate(images):
             zf.writestr(f"product_image_{i+1}.{ext}", img["bytes"])
     buf.seek(0)
@@ -397,13 +398,12 @@ with col1:
 
         st.markdown('<div class="section-title">הגדרות</div>', unsafe_allow_html=True)
 
-        default_text_idx = 0 if upload_mode == "PDF של אריזה" else 1
         text_style = st.radio(
             "אורך טקסט שיווקי",
-            options=["ארוך ומפורט", "קצר ומינימליסטי"],
-            index=default_text_idx,
+            options=["ללא תיאור שיווקי", "ארוך ומפורט", "קצר ומינימליסטי"],
+            index=0,
             horizontal=True,
-            help="ארוך = 3-4 פסקאות. קצר = פסקה + bullets",
+            help="ללא = רק תמונות מוצר, בלי טקסט בעברית (מהיר וחינמי). ארוך = 3-4 פסקאות. קצר = פסקה + bullets.",
         )
 
         image_size = st.radio(
@@ -439,6 +439,7 @@ if run_btn and uploaded:
         all_image_bytes = [f.read() for f in uploaded_files]
         display_filename = Path(uploaded_files[0].name).stem + "_multi"
 
+    skip_hebrew = text_style == "ללא תיאור שיווקי"
     style_arg = "long" if text_style == "ארוך ומפורט" else "short"
 
     try:
@@ -454,9 +455,11 @@ if run_btn and uploaded:
                         images.append({"bytes": resized, "width": pil.width, "height": pil.height, "xref": i})
                     status.update(label=f"{len(images)} תמונות מעובדות", state="complete")
 
-                with st.status(f"מייצר תוכן שיווקי ({text_style}) בעברית מכל התמונות...", expanded=True) as status:
-                    hebrew_content = generate_hebrew_from_images(client, [img["bytes"] for img in images], style=style_arg)
-                    status.update(label="תוכן שיווקי מוכן!", state="complete")
+                hebrew_content = ""
+                if not skip_hebrew:
+                    with st.status(f"מייצר תוכן שיווקי ({text_style}) בעברית מכל התמונות...", expanded=True) as status:
+                        hebrew_content = generate_hebrew_from_images(client, [img["bytes"] for img in images], style=style_arg)
+                        status.update(label="תוכן שיווקי מוכן!", state="complete")
 
                 packaging_text = ""
                 bg_removed = False
@@ -502,17 +505,20 @@ if run_btn and uploaded:
                         bg_removed = True
                         status.update(label="רקע הוסר בהצלחה!", state="complete")
 
-                with st.status("קורא טקסט מהאריזה...", expanded=True) as status:
-                    num_pages = get_pdf_page_count(pdf_bytes)
-                    page_jpegs = []
-                    for p in range(1, num_pages + 1):
-                        page_jpegs.append(rasterize_pdf_page(pdf_bytes, page=p, dpi=200))
-                    packaging_text = extract_packaging_text(client, page_jpegs)
-                    status.update(label=f"טקסט אריזה חולץ ({num_pages} עמודים)", state="complete")
+                packaging_text = ""
+                hebrew_content = ""
+                if not skip_hebrew:
+                    with st.status("קורא טקסט מהאריזה...", expanded=True) as status:
+                        num_pages = get_pdf_page_count(pdf_bytes)
+                        page_jpegs = []
+                        for p in range(1, num_pages + 1):
+                            page_jpegs.append(rasterize_pdf_page(pdf_bytes, page=p, dpi=200))
+                        packaging_text = extract_packaging_text(client, page_jpegs)
+                        status.update(label=f"טקסט אריזה חולץ ({num_pages} עמודים)", state="complete")
 
-                with st.status(f"מייצר תוכן שיווקי ({text_style}) בעברית...", expanded=True) as status:
-                    hebrew_content = generate_hebrew_content(client, packaging_text, style=style_arg)
-                    status.update(label="תוכן שיווקי מוכן!", state="complete")
+                    with st.status(f"מייצר תוכן שיווקי ({text_style}) בעברית...", expanded=True) as status:
+                        hebrew_content = generate_hebrew_content(client, packaging_text, style=style_arg)
+                        status.update(label="תוכן שיווקי מוכן!", state="complete")
 
             st.session_state["results"] = {
                 "images": images,
@@ -555,22 +561,26 @@ if results:
             st.warning("לא נמצאו תמונות מוצר מוטמעות ב-PDF")
         st.markdown('</div>', unsafe_allow_html=True)
 
+        download_step = 3
+        if hebrew_content:
+            st.markdown('<div class="card">', unsafe_allow_html=True)
+            st.markdown('<div class="section-title"><span class="step-badge">3</span> תוכן שיווקי – עברית</div>', unsafe_allow_html=True)
+
+            if packaging_text:
+                with st.expander("טקסט אנגלי שחולץ מהאריזה"):
+                    st.text(packaging_text)
+
+            st.markdown(f'<div class="hebrew-content">{hebrew_content.replace(chr(10), "<br>")}</div>', unsafe_allow_html=True)
+            st.code(hebrew_content, language=None)
+            st.markdown('</div>', unsafe_allow_html=True)
+            download_step = 4
+
         st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown('<div class="section-title"><span class="step-badge">3</span> תוכן שיווקי – עברית</div>', unsafe_allow_html=True)
-
-        if packaging_text:
-            with st.expander("טקסט אנגלי שחולץ מהאריזה"):
-                st.text(packaging_text)
-
-        st.markdown(f'<div class="hebrew-content">{hebrew_content.replace(chr(10), "<br>")}</div>', unsafe_allow_html=True)
-        st.code(hebrew_content, language=None)
-        st.markdown('</div>', unsafe_allow_html=True)
-
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown('<div class="section-title"><span class="step-badge">4</span> הורדה</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="section-title"><span class="step-badge">{download_step}</span> הורדה</div>', unsafe_allow_html=True)
         zip_bytes = create_zip(images, hebrew_content, bg_removed)
+        zip_label = "הורד ZIP (תמונות + תוכן עברי)" if hebrew_content else "הורד ZIP (תמונות)"
         st.download_button(
-            label="הורד ZIP (תמונות + תוכן עברי)",
+            label=zip_label,
             data=zip_bytes,
             file_name=f"{Path(filename).stem}_processed.zip",
             mime="application/zip",
