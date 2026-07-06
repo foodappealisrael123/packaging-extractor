@@ -218,16 +218,24 @@ def get_pdf_page_count(pdf_bytes: bytes) -> int:
 
 
 def resize_to_square(img_bytes: bytes, size: int | None = None) -> bytes:
-    """Crop image to center square and resize. If size is None, keep original resolution."""
+    """Pad the image with white to a square canvas (max dimension), then resize.
+    Preserves the entire product — no cropping. If size is None, keep the padded resolution."""
     img = Image.open(io.BytesIO(img_bytes))
-    side = min(img.width, img.height)
-    left = (img.width - side) // 2
-    top = (img.height - side) // 2
-    img = img.crop((left, top, left + side, top + side))
-    if size and img.width != size:
-        img = img.resize((size, size), Image.LANCZOS)
+    if img.mode == "RGBA":
+        white = Image.new("RGB", img.size, (255, 255, 255))
+        white.paste(img, mask=img.split()[3])
+        img = white
+    else:
+        img = img.convert("RGB")
+    side = max(img.width, img.height)
+    canvas = Image.new("RGB", (side, side), (255, 255, 255))
+    offset_x = (side - img.width) // 2
+    offset_y = (side - img.height) // 2
+    canvas.paste(img, (offset_x, offset_y))
+    if size and canvas.width != size:
+        canvas = canvas.resize((size, size), Image.LANCZOS)
     buf = io.BytesIO()
-    img.convert("RGB").save(buf, format="JPEG", quality=95)
+    canvas.save(buf, format="JPEG", quality=95)
     return buf.getvalue()
 
 
