@@ -9,6 +9,8 @@ import fitz  # PyMuPDF
 import subprocess
 import tempfile
 import io
+import gc
+import shutil
 
 # ─────────────────────────────────────────
 #  Page config
@@ -227,6 +229,8 @@ def resize_to_square(img_bytes: bytes, size: int | None = None) -> bytes:
         img = white
     else:
         img = img.convert("RGB")
+    if size and max(img.size) > size:
+        img.thumbnail((size, size), Image.LANCZOS)  # shrink before padding to save memory
     side = max(img.width, img.height)
     canvas = Image.new("RGB", (side, side), (255, 255, 255))
     offset_x = (side - img.width) // 2
@@ -267,7 +271,7 @@ def remove_background_to_white(img_bytes: bytes) -> bytes:
 
 
 FSRCNN_URL = "https://raw.githubusercontent.com/Saafke/FSRCNN_Tensorflow/master/models/FSRCNN_x{scale}.pb"
-MAX_UPSCALED_SIDE = 4096  # keeps memory/ZIP size sane on Streamlit Cloud
+MAX_UPSCALED_SIDE = 3000  # keeps memory within Streamlit Cloud's limit
 
 
 @st.cache_resource
@@ -314,15 +318,20 @@ def upscale_image(img_bytes: bytes, scale: int) -> tuple[bytes, bool]:
     rgb = img.convert("RGB")
     used_ai = True
 
-    if side >= MAX_UPSCALED_SIDE:
-        # Already at/above the cap – a plain high-quality downscale is best
+    factor = out_side / side
+    if factor < 1.5:
+        # At/near the cap already – a plain high-quality resize is enough
         up_rgb = rgb.resize(target, Image.LANCZOS)
     else:
-        # If the full scale would overshoot the cap, use the smallest model scale that reaches it
-        model_scale = min(scale, max(2, -(-MAX_UPSCALED_SIDE // side)))
+        # Smallest model scale that reaches the target; shrink the input so the
+        # model never produces more pixels than needed (keeps memory low)
+        model_scale = min(scale, max(2, -(-out_side // side)))
+        need = -(-out_side // model_scale)
+        src = rgb if need >= side else rgb.resize(
+            (round(rgb.width * need / side), round(rgb.height * need / side)), Image.LANCZOS)
         try:
             sr = get_upscaler(model_scale)
-            bgr = np.array(rgb)[:, :, ::-1]
+            bgr = np.array(src)[:, :, ::-1]
             up_rgb = Image.fromarray(_sr_tiled(sr, bgr, model_scale)[:, :, ::-1].copy())
             if up_rgb.size != target:
                 up_rgb = up_rgb.resize(target, Image.LANCZOS)
@@ -362,21 +371,30 @@ def make_thumbnail(img_bytes: bytes, size: int = 360) -> bytes:
 
 
 def finish_images(raw_list: list[bytes], transparent: bool, scale: int, target_size: int | None,
-                  status, label_prefix: str = "") -> tuple[list[dict], bool]:
+                  out_dir: str, status, label_prefix: str = "") -> tuple[list[dict], bool]:
     """Square-pad → remove background → upscale → optional final resize.
-    Returns (images, all_used_ai)."""
+    Full-size results are written to out_dir (not kept in memory); returns
+    (images with path + thumbnail, all_used_ai)."""
     images = []
     all_ai = True
     for i, raw in enumerate(raw_list):
         status.update(label=f"{label_prefix}מסיר רקע ומגדיל תמונה {i+1}/{len(raw_list)}...")
-        squared = resize_to_square(raw, None)
+        # Huge sources would blow the memory limit in rembg; the output is capped anyway
+        side = max(Image.open(io.BytesIO(raw)).size)
+        squared = resize_to_square(raw, MAX_UPSCALED_SIDE if side > MAX_UPSCALED_SIDE else None)
         clean = remove_background(squared) if transparent else remove_background_to_white(squared)
+        del squared
         up, used_ai = upscale_image(clean, scale)
+        del clean
         all_ai = all_ai and used_ai
         if target_size:
             up = fit_to_size(up, target_size)
         pil = Image.open(io.BytesIO(up))
-        images.append({"bytes": up, "thumb": make_thumbnail(up), "width": pil.width, "height": pil.height})
+        path = Path(out_dir) / f"{len(os.listdir(out_dir))}.{'png' if transparent else 'jpg'}"
+        path.write_bytes(up)
+        images.append({"path": str(path), "thumb": make_thumbnail(up), "width": pil.width, "height": pil.height})
+        del up, pil
+        gc.collect()
     return images, all_ai
 
 
@@ -475,7 +493,7 @@ def create_zip(groups: list[dict], ext: str, selected: set[tuple[int, int]] | No
             if group["hebrew"]:
                 zf.writestr(f"{folder}/marketing_content_he.txt", group["hebrew"].encode("utf-8"))
             for i in picked:
-                zf.writestr(f"{folder}/product_image_{i+1}.{ext}", group["images"][i]["bytes"])
+                zf.write(group["images"][i]["path"], f"{folder}/product_image_{i+1}.{ext}")
     buf.seek(0)
     return buf.read()
 
@@ -603,6 +621,13 @@ if run_btn and uploaded_files and not too_many:
     scale = UPSCALE_OPTIONS[upscale_choice]
     target_size = 900 if image_size == "900x900" else None
 
+    # Full-size outputs live on disk; drop the previous run's folder and results first
+    old = st.session_state.pop("results", None)
+    if old and old.get("out_dir"):
+        shutil.rmtree(old["out_dir"], ignore_errors=True)
+    gc.collect()
+    out_dir = tempfile.mkdtemp(prefix="pe_")
+
     groups = []
     all_ai = True
     try:
@@ -611,13 +636,14 @@ if run_btn and uploaded_files and not too_many:
                 # === MULTI-IMAGE MODE: all images are one product ===
                 all_image_bytes = [f.read() for f in uploaded_files]
                 with st.status(f"מעבד {len(all_image_bytes)} תמונות...", expanded=True) as status:
-                    images, used_ai = finish_images(all_image_bytes, transparent_output, scale, target_size, status)
+                    images, used_ai = finish_images(all_image_bytes, transparent_output, scale, target_size,
+                                                    out_dir, status)
                     all_ai = all_ai and used_ai
                     hebrew_content = ""
                     if not skip_hebrew:
                         status.update(label=f"מייצר תוכן שיווקי ({text_style}) בעברית...")
                         hebrew_content = generate_hebrew_from_images(
-                            client, [img["bytes"] for img in images], style=style_arg)
+                            client, [Path(img["path"]).read_bytes() for img in images], style=style_arg)
                     status.update(label=f"{len(images)} תמונות מוכנות", state="complete")
                 groups.append({
                     "name": Path(uploaded_files[0].name).stem + "_multi",
@@ -643,7 +669,11 @@ if run_btn and uploaded_files and not too_many:
                             except Exception:
                                 kept.append(img["bytes"])
 
-                        images, used_ai = finish_images(kept, transparent_output, scale, target_size, status, prefix)
+                        filtered_out = len(raw_images) - len(kept)
+                        del raw_images
+                        images, used_ai = finish_images(kept, transparent_output, scale, target_size,
+                                                        out_dir, status, prefix)
+                        del kept
                         all_ai = all_ai and used_ai
 
                         packaging_text = ""
@@ -657,7 +687,7 @@ if run_btn and uploaded_files and not too_many:
                             hebrew_content = generate_hebrew_content(client, packaging_text, style=style_arg)
 
                         status.update(
-                            label=f"{prefix}{len(images)} תמונות מוכנות (סוננו {len(raw_images) - len(kept)})",
+                            label=f"{prefix}{len(images)} תמונות מוכנות (סוננו {filtered_out})",
                             state="complete",
                         )
 
@@ -679,6 +709,7 @@ if run_btn and uploaded_files and not too_many:
             "zip_name": Path(uploaded_files[0].name).stem if len(uploaded_files) == 1 else "packaging_batch",
             "scale": scale,
             "all_ai": all_ai,
+            "out_dir": out_dir,
         }
 
     except anthropic.AuthenticationError:
