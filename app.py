@@ -239,17 +239,25 @@ def resize_to_square(img_bytes: bytes, size: int | None = None) -> bytes:
     return buf.getvalue()
 
 
+@st.cache_resource
+def get_rembg_session():
+    """Load a lightweight rembg model once. Newer rembg versions default to
+    bria-rmbg (~1GB), which crashes Streamlit Cloud's memory limit."""
+    from rembg import new_session
+    return new_session("isnet-general-use")
+
+
 def remove_background(img_bytes: bytes) -> bytes:
     """Remove background using rembg. Returns PNG bytes with transparency."""
     from rembg import remove
-    return remove(img_bytes)
+    return remove(img_bytes, session=get_rembg_session())
 
 
 def remove_background_to_white(img_bytes: bytes) -> bytes:
     """Remove background and composite the product onto a clean white canvas.
     Returns JPG bytes."""
     from rembg import remove
-    no_bg = remove(img_bytes)
+    no_bg = remove(img_bytes, session=get_rembg_session())
     fg = Image.open(io.BytesIO(no_bg)).convert("RGBA")
     white = Image.new("RGB", fg.size, (255, 255, 255))
     white.paste(fg, mask=fg.split()[3])
