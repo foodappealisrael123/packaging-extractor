@@ -622,6 +622,7 @@ if run_btn and uploaded_files and not too_many:
     target_size = 900 if image_size == "900x900" else None
 
     # Full-size outputs live on disk; drop the previous run's folder and results first
+    st.session_state.pop("zip_ready", None)
     old = st.session_state.pop("results", None)
     if old and old.get("out_dir"):
         shutil.rmtree(old["out_dir"], ignore_errors=True)
@@ -755,24 +756,42 @@ def render_gallery(results: dict, run_id: int):
     selected = {gi for gi, k in keys.items() if st.session_state.get(k)}
     st.markdown("---")
     has_text = any(group["hebrew"] for group in groups)
-    st.download_button(
-        label=f"📦 הורד הכל ({len(keys)} תמונות{' + טקסטים' if has_text else ''})",
-        data=lambda: create_zip(groups, ext),  # built only when clicked
-        file_name=f"{results['zip_name']}_processed.zip",
-        mime="application/zip",
-        use_container_width=True,
-        on_click="ignore",
-        disabled=not keys,
-    )
-    st.download_button(
-        label=f"✅ הורד נבחרות ({len(selected)})",
-        data=lambda sel=frozenset(selected): create_zip(groups, ext, set(sel)),
-        file_name=f"{results['zip_name']}_selected.zip",
-        mime="application/zip",
-        use_container_width=True,
-        on_click="ignore",
-        disabled=not selected,
-    )
+
+    # Two-step download: build the ZIP on demand, then hand it over as plain bytes.
+    # Only one prepared ZIP is held in memory, and it's dropped once it no longer
+    # matches what's on screen.
+    c1, c2 = st.columns(2)
+    if c1.button(f"📦 הכן את כל התמונות ({len(keys)})", use_container_width=True, disabled=not keys):
+        st.session_state["zip_ready"] = {
+            "sig": (run_id, "all"),
+            "data": create_zip(groups, ext),
+            "name": f"{results['zip_name']}_processed.zip",
+            "label": f"⬇️ הורד הכל ({len(keys)} תמונות{' + טקסטים' if has_text else ''})",
+        }
+    if c2.button(f"✅ הכן את הנבחרות ({len(selected)})", use_container_width=True, disabled=not selected):
+        st.session_state["zip_ready"] = {
+            "sig": (run_id, frozenset(selected)),
+            "data": create_zip(groups, ext, selected),
+            "name": f"{results['zip_name']}_selected.zip",
+            "label": f"⬇️ הורד {len(selected)} תמונות נבחרות",
+        }
+
+    ready = st.session_state.get("zip_ready")
+    if ready and ready["sig"] not in ((run_id, "all"), (run_id, frozenset(selected))):
+        del st.session_state["zip_ready"]  # selection changed – stale ZIP
+        ready = None
+    if ready:
+        st.download_button(
+            label=ready["label"],
+            data=ready["data"],
+            file_name=ready["name"],
+            mime="application/zip",
+            use_container_width=True,
+            type="primary",
+            on_click="ignore",
+        )
+    else:
+        st.caption("בחר תמונות (או הכל), לחץ \"הכן\" ואז יופיע כפתור ההורדה.")
 
 
 results = st.session_state.get("results")
