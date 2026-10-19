@@ -1,5 +1,6 @@
 anthropic>=0.40.0
-streamlit>=1.35.0
+streamlit>=1.50.0
 pymupdf>=1.24.0
 Pillow>=10.0.0
 rembg[cpu]>=2.0.70
+opencv-contrib-python-headless>=4.10.0

@@ -266,6 +266,120 @@ def remove_background_to_white(img_bytes: bytes) -> bytes:
     return buf.getvalue()
 
 
+FSRCNN_URL = "https://raw.githubusercontent.com/Saafke/FSRCNN_Tensorflow/master/models/FSRCNN_x{scale}.pb"
+MAX_UPSCALED_SIDE = 4096  # keeps memory/ZIP size sane on Streamlit Cloud
+
+
+@st.cache_resource
+def get_upscaler(scale: int):
+    """Load the FSRCNN super-resolution model (~40KB) once per scale."""
+    import cv2
+    import urllib.request
+    model_path = Path(tempfile.gettempdir()) / f"FSRCNN_x{scale}.pb"
+    if not model_path.exists():
+        urllib.request.urlretrieve(FSRCNN_URL.format(scale=scale), model_path)
+    sr = cv2.dnn_superres.DnnSuperResImpl_create()
+    sr.readModel(str(model_path))
+    sr.setModel("fsrcnn", scale)
+    return sr
+
+
+def _sr_tiled(sr, bgr, scale: int, tile: int = 384, pad: int = 8):
+    """Run super-resolution in overlapping tiles so large images don't exhaust memory."""
+    import numpy as np
+    h, w = bgr.shape[:2]
+    out = np.zeros((h * scale, w * scale, 3), dtype=np.uint8)
+    for y in range(0, h, tile):
+        for x in range(0, w, tile):
+            y0, x0 = max(y - pad, 0), max(x - pad, 0)
+            y1, x1 = min(y + tile + pad, h), min(x + tile + pad, w)
+            up = sr.upsample(np.ascontiguousarray(bgr[y0:y1, x0:x1]))
+            th, tw = (min(y + tile, h) - y) * scale, (min(x + tile, w) - x) * scale
+            oy, ox = (y - y0) * scale, (x - x0) * scale
+            out[y * scale:y * scale + th, x * scale:x * scale + tw] = up[oy:oy + th, ox:ox + tw]
+    return out
+
+
+def upscale_image(img_bytes: bytes, scale: int) -> tuple[bytes, bool]:
+    """Upscale ×scale with FSRCNN (Lanczos fallback). Keeps transparency.
+    Returns (bytes, used_ai). Output is capped at MAX_UPSCALED_SIDE."""
+    import numpy as np
+    img = Image.open(io.BytesIO(img_bytes))
+    has_alpha = img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info)
+    img = img.convert("RGBA" if has_alpha else "RGB")
+
+    side = max(img.size)
+    out_side = min(side * scale, MAX_UPSCALED_SIDE)
+    target = (round(img.width * out_side / side), round(img.height * out_side / side))
+    rgb = img.convert("RGB")
+    used_ai = True
+
+    if side >= MAX_UPSCALED_SIDE:
+        # Already at/above the cap – a plain high-quality downscale is best
+        up_rgb = rgb.resize(target, Image.LANCZOS)
+    else:
+        # If the full scale would overshoot the cap, use the smallest model scale that reaches it
+        model_scale = min(scale, max(2, -(-MAX_UPSCALED_SIDE // side)))
+        try:
+            sr = get_upscaler(model_scale)
+            bgr = np.array(rgb)[:, :, ::-1]
+            up_rgb = Image.fromarray(_sr_tiled(sr, bgr, model_scale)[:, :, ::-1].copy())
+            if up_rgb.size != target:
+                up_rgb = up_rgb.resize(target, Image.LANCZOS)
+        except Exception:
+            used_ai = False
+            up_rgb = rgb.resize(target, Image.LANCZOS)
+
+    buf = io.BytesIO()
+    if has_alpha:
+        up = up_rgb.convert("RGBA")
+        up.putalpha(img.split()[3].resize(target, Image.LANCZOS))
+        up.save(buf, format="PNG")
+    else:
+        up_rgb.save(buf, format="JPEG", quality=95)
+    return buf.getvalue(), used_ai
+
+
+def fit_to_size(img_bytes: bytes, size: int) -> bytes:
+    """Resize a square image to size×size, keeping transparency if present."""
+    img = Image.open(io.BytesIO(img_bytes))
+    has_alpha = img.mode in ("RGBA", "LA")
+    img = img.convert("RGBA" if has_alpha else "RGB").resize((size, size), Image.LANCZOS)
+    buf = io.BytesIO()
+    if has_alpha:
+        img.save(buf, format="PNG")
+    else:
+        img.save(buf, format="JPEG", quality=95)
+    return buf.getvalue()
+
+
+def make_thumbnail(img_bytes: bytes, size: int = 360) -> bytes:
+    img = Image.open(io.BytesIO(img_bytes))
+    img.thumbnail((size, size), Image.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def finish_images(raw_list: list[bytes], transparent: bool, scale: int, target_size: int | None,
+                  status, label_prefix: str = "") -> tuple[list[dict], bool]:
+    """Square-pad → remove background → upscale → optional final resize.
+    Returns (images, all_used_ai)."""
+    images = []
+    all_ai = True
+    for i, raw in enumerate(raw_list):
+        status.update(label=f"{label_prefix}מסיר רקע ומגדיל תמונה {i+1}/{len(raw_list)}...")
+        squared = resize_to_square(raw, None)
+        clean = remove_background(squared) if transparent else remove_background_to_white(squared)
+        up, used_ai = upscale_image(clean, scale)
+        all_ai = all_ai and used_ai
+        if target_size:
+            up = fit_to_size(up, target_size)
+        pil = Image.open(io.BytesIO(up))
+        images.append({"bytes": up, "thumb": make_thumbnail(up), "width": pil.width, "height": pil.height})
+    return images, all_ai
+
+
 def is_product_image(client: anthropic.Anthropic, img_bytes: bytes) -> bool:
     """Use Claude Vision to decide if an image is a clean product shot worth keeping.
     Filters out: designer PSD mockups, instructional diagrams, small logos/icons,
@@ -348,15 +462,20 @@ def generate_hebrew_from_images(client: anthropic.Anthropic, img_bytes_list: lis
     return msg.content[0].text
 
 
-def create_zip(images: list[dict], hebrew_text: str, bg_removed: bool = False) -> bytes:
-    """Pack product images + (optional) Hebrew text file into a ZIP."""
-    ext = "png" if bg_removed else "jpg"
+def create_zip(groups: list[dict], ext: str, selected: set[tuple[int, int]] | None = None) -> bytes:
+    """Pack images (+ Hebrew text per source file) into a ZIP, one folder per source.
+    If `selected` is given, only those (group_idx, image_idx) pairs are included."""
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        if hebrew_text:
-            zf.writestr("marketing_content_he.txt", hebrew_text.encode("utf-8"))
-        for i, img in enumerate(images):
-            zf.writestr(f"product_image_{i+1}.{ext}", img["bytes"])
+        for g, group in enumerate(groups):
+            folder = group["name"]
+            picked = [i for i in range(len(group["images"])) if selected is None or (g, i) in selected]
+            if not picked:
+                continue
+            if group["hebrew"]:
+                zf.writestr(f"{folder}/marketing_content_he.txt", group["hebrew"].encode("utf-8"))
+            for i in picked:
+                zf.writestr(f"{folder}/product_image_{i+1}.{ext}", group["images"][i]["bytes"])
     buf.seek(0)
     return buf.read()
 
@@ -392,11 +511,14 @@ with st.sidebar:
 - 📥 מייצרת ZIP להורדה
     """)
 
+MAX_PDFS = 10
+UPSCALE_OPTIONS = {"×2": 2, "×3": 3, "×4": 4}
+
 col1, col2 = st.columns([1, 1], gap="large")
 
 with col1:
     st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.markdown('<div class="section-title"><span class="step-badge">1</span> העלאת קובץ</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-title"><span class="step-badge">1</span> העלאת קבצים</div>', unsafe_allow_html=True)
 
     upload_mode = st.radio(
         "סוג קלט",
@@ -405,9 +527,13 @@ with col1:
     )
 
     if upload_mode == "PDF של אריזה":
-        uploaded_files = st.file_uploader("גרור PDF של אריזת מוצר", type=["pdf"], label_visibility="collapsed", key="pdf_upl")
-        uploaded = uploaded_files
-        upload_count = 1 if uploaded else 0
+        uploaded_files = st.file_uploader(
+            f"גרור עד {MAX_PDFS} קבצי PDF של אריזות",
+            type=["pdf"],
+            label_visibility="collapsed",
+            accept_multiple_files=True,
+            key="pdf_upl",
+        )
     else:
         uploaded_files = st.file_uploader(
             "גרור תמונות מוצר (אפשר כמה - למשל מוצר + אביזרים)",
@@ -416,14 +542,15 @@ with col1:
             accept_multiple_files=True,
             key="img_upl",
         )
-        uploaded = uploaded_files if uploaded_files else None
-        upload_count = len(uploaded_files) if uploaded_files else 0
+    uploaded_files = uploaded_files or []
+    too_many = upload_mode == "PDF של אריזה" and len(uploaded_files) > MAX_PDFS
 
-    if uploaded:
-        if upload_mode == "PDF של אריזה":
-            st.success(f"✅ {uploaded.name} ({uploaded.size // 1024} KB)")
+    if uploaded_files:
+        kind = "קבצי PDF" if upload_mode == "PDF של אריזה" else "תמונות"
+        if too_many:
+            st.error(f"הועלו {len(uploaded_files)} קבצים – אפשר עד {MAX_PDFS} בבת אחת. הסר חלק מהקבצים.")
         else:
-            st.success(f"✅ הועלו {upload_count} תמונות: " + ", ".join(f.name for f in uploaded_files))
+            st.success(f"✅ הועלו {len(uploaded_files)} {kind}: " + ", ".join(f.name for f in uploaded_files))
 
         st.markdown('<div class="section-title">הגדרות</div>', unsafe_allow_html=True)
 
@@ -432,12 +559,21 @@ with col1:
             options=["ללא תיאור שיווקי", "ארוך ומפורט", "קצר ומינימליסטי"],
             index=0,
             horizontal=True,
-            help="ללא = רק תמונות מוצר, בלי טקסט בעברית (מהיר וחינמי). ארוך = 3-4 פסקאות. קצר = פסקה + bullets.",
+            help="ללא = רק תמונות מוצר, בלי טקסט בעברית (מהיר וחינמי). ארוך = 3-4 פסקאות. קצר = פסקה + bullets. "
+                 "במצב PDF נכתב טקסט נפרד לכל קובץ.",
+        )
+
+        upscale_choice = st.radio(
+            "הגדלת רזולוציה (Upscale)",
+            options=list(UPSCALE_OPTIONS),
+            index=0,
+            horizontal=True,
+            help=f"הגדלה חכמה (AI) של כל תמונה. הצד הארוך מוגבל ל-{MAX_UPSCALED_SIDE}px.",
         )
 
         image_size = st.radio(
-            "גודל תמונות",
-            options=["900x900", "גודל מקסימלי"],
+            "גודל תמונות סופי",
+            options=["גודל מקסימלי (אחרי הגדלה)", "900x900"],
             horizontal=True,
         )
 
@@ -450,128 +586,100 @@ with col1:
         )
         transparent_output = bg_choice == "רקע שקוף"
 
-        run_btn = st.button("🚀 עבד", use_container_width=True)
+        run_btn = st.button("🚀 עבד", use_container_width=True, disabled=too_many)
     else:
         run_btn = False
-        text_style = "ארוך ומפורט"
-        transparent_output = False
-        st.info("📂 ממתין לקובץ...")
+        st.info("📂 ממתין לקבצים...")
     st.markdown('</div>', unsafe_allow_html=True)
 
-if run_btn and uploaded:
+if run_btn and uploaded_files and not too_many:
     if not api_key:
         st.error("הכנס Anthropic API Key בסרגל השמאלי")
         st.stop()
 
     client = anthropic.Anthropic(api_key=api_key)
-
-    if upload_mode == "PDF של אריזה":
-        file_bytes = uploaded.read()
-        display_filename = uploaded.name
-    else:
-        all_image_bytes = [f.read() for f in uploaded_files]
-        display_filename = Path(uploaded_files[0].name).stem + "_multi"
-
     skip_hebrew = text_style == "ללא תיאור שיווקי"
     style_arg = "long" if text_style == "ארוך ומפורט" else "short"
+    scale = UPSCALE_OPTIONS[upscale_choice]
+    target_size = 900 if image_size == "900x900" else None
 
+    groups = []
+    all_ai = True
     try:
-        if upload_mode == "תמונות מוצר":
-            # === MULTI-IMAGE MODE ===
-            with col1:
+        with col1:
+            if upload_mode == "תמונות מוצר":
+                # === MULTI-IMAGE MODE: all images are one product ===
+                all_image_bytes = [f.read() for f in uploaded_files]
                 with st.status(f"מעבד {len(all_image_bytes)} תמונות...", expanded=True) as status:
-                    target_size = 900 if image_size == "900x900" else None
-                    images = []
-                    for i, raw in enumerate(all_image_bytes):
-                        resized = resize_to_square(raw, target_size)
-                        pil = Image.open(io.BytesIO(resized))
-                        images.append({"bytes": resized, "width": pil.width, "height": pil.height, "xref": i})
-                    status.update(label=f"{len(images)} תמונות מעובדות", state="complete")
+                    images, used_ai = finish_images(all_image_bytes, transparent_output, scale, target_size, status)
+                    all_ai = all_ai and used_ai
+                    hebrew_content = ""
+                    if not skip_hebrew:
+                        status.update(label=f"מייצר תוכן שיווקי ({text_style}) בעברית...")
+                        hebrew_content = generate_hebrew_from_images(
+                            client, [img["bytes"] for img in images], style=style_arg)
+                    status.update(label=f"{len(images)} תמונות מוכנות", state="complete")
+                groups.append({
+                    "name": Path(uploaded_files[0].name).stem + "_multi",
+                    "images": images,
+                    "hebrew": hebrew_content,
+                    "packaging_text": "",
+                })
+            else:
+                # === PDF MODE: each PDF is processed separately ===
+                total = len(uploaded_files)
+                used_names = set()
+                for n, f in enumerate(uploaded_files, start=1):
+                    prefix = f"[{n}/{total}] {f.name}: "
+                    pdf_bytes = f.read()
+                    with st.status(f"{prefix}שולף תמונות...", expanded=False) as status:
+                        raw_images = extract_images_from_pdf(pdf_bytes)
+                        kept = []
+                        for i, img in enumerate(raw_images):
+                            status.update(label=f"{prefix}מסנן תמונות ({i+1}/{len(raw_images)})...")
+                            try:
+                                if is_product_image(client, img["bytes"]):
+                                    kept.append(img["bytes"])
+                            except Exception:
+                                kept.append(img["bytes"])
 
-                bg_label = "רקע שקוף (PNG)" if transparent_output else "רקע לבן נקי (JPG)"
-                with st.status(f"מסיר רקע מקורי ומכין תמונות עם {bg_label}...", expanded=True) as status:
-                    for i, img in enumerate(images):
-                        if transparent_output:
-                            img["bytes"] = remove_background(img["bytes"])
-                        else:
-                            img["bytes"] = remove_background_to_white(img["bytes"])
-                        status.update(label=f"מעבד תמונה {i+1}/{len(images)}...")
-                    status.update(label=f"רקע {bg_label} הוחל בהצלחה!", state="complete")
-                bg_removed = transparent_output
+                        images, used_ai = finish_images(kept, transparent_output, scale, target_size, status, prefix)
+                        all_ai = all_ai and used_ai
 
-                hebrew_content = ""
-                if not skip_hebrew:
-                    with st.status(f"מייצר תוכן שיווקי ({text_style}) בעברית מכל התמונות...", expanded=True) as status:
-                        hebrew_content = generate_hebrew_from_images(client, [img["bytes"] for img in images], style=style_arg)
-                        status.update(label="תוכן שיווקי מוכן!", state="complete")
+                        packaging_text = ""
+                        hebrew_content = ""
+                        if not skip_hebrew:
+                            status.update(label=f"{prefix}קורא טקסט מהאריזה...")
+                            num_pages = get_pdf_page_count(pdf_bytes)
+                            page_jpegs = [rasterize_pdf_page(pdf_bytes, page=p, dpi=200) for p in range(1, num_pages + 1)]
+                            packaging_text = extract_packaging_text(client, page_jpegs)
+                            status.update(label=f"{prefix}מייצר תוכן שיווקי בעברית...")
+                            hebrew_content = generate_hebrew_content(client, packaging_text, style=style_arg)
 
-                packaging_text = ""
+                        status.update(
+                            label=f"{prefix}{len(images)} תמונות מוכנות (סוננו {len(raw_images) - len(kept)})",
+                            state="complete",
+                        )
 
-            st.session_state["results"] = {
-                "images": images,
-                "packaging_text": packaging_text,
-                "hebrew_content": hebrew_content,
-                "filename": display_filename,
-                "bg_removed": bg_removed,
-            }
+                    name = Path(f.name).stem
+                    while name in used_names:
+                        name += "_"
+                    used_names.add(name)
+                    groups.append({
+                        "name": name,
+                        "images": images,
+                        "hebrew": hebrew_content,
+                        "packaging_text": packaging_text,
+                    })
 
-        else:
-            # === PDF MODE ===
-            pdf_bytes = file_bytes
-            with col1:
-                with st.status("שולף תמונות מה-PDF...", expanded=True) as status:
-                    raw_images = extract_images_from_pdf(pdf_bytes)
-                    status.update(label=f"נמצאו {len(raw_images)} תמונות, מסנן...")
-
-                    images = []
-                    for i, img in enumerate(raw_images):
-                        status.update(label=f"מסנן תמונות ({i+1}/{len(raw_images)})...")
-                        try:
-                            if is_product_image(client, img["bytes"]):
-                                images.append(img)
-                        except Exception:
-                            images.append(img)
-
-                    target_size = 900 if image_size == "900x900" else None
-                    for img in images:
-                        img["bytes"] = resize_to_square(img["bytes"], target_size)
-                        pil = Image.open(io.BytesIO(img["bytes"]))
-                        img["width"], img["height"] = pil.width, pil.height
-                    status.update(label=f"{len(images)} תמונות מוצר איכותיות (סוננו {len(raw_images)-len(images)})", state="complete")
-
-                bg_label = "רקע שקוף (PNG)" if transparent_output else "רקע לבן נקי (JPG)"
-                with st.status(f"מסיר רקע מקורי ומכין תמונות עם {bg_label}...", expanded=True) as status:
-                    for i, img in enumerate(images):
-                        if transparent_output:
-                            img["bytes"] = remove_background(img["bytes"])
-                        else:
-                            img["bytes"] = remove_background_to_white(img["bytes"])
-                        status.update(label=f"מעבד תמונה {i+1}/{len(images)}...")
-                    status.update(label=f"רקע {bg_label} הוחל בהצלחה!", state="complete")
-                bg_removed = transparent_output
-
-                packaging_text = ""
-                hebrew_content = ""
-                if not skip_hebrew:
-                    with st.status("קורא טקסט מהאריזה...", expanded=True) as status:
-                        num_pages = get_pdf_page_count(pdf_bytes)
-                        page_jpegs = []
-                        for p in range(1, num_pages + 1):
-                            page_jpegs.append(rasterize_pdf_page(pdf_bytes, page=p, dpi=200))
-                        packaging_text = extract_packaging_text(client, page_jpegs)
-                        status.update(label=f"טקסט אריזה חולץ ({num_pages} עמודים)", state="complete")
-
-                    with st.status(f"מייצר תוכן שיווקי ({text_style}) בעברית...", expanded=True) as status:
-                        hebrew_content = generate_hebrew_content(client, packaging_text, style=style_arg)
-                        status.update(label="תוכן שיווקי מוכן!", state="complete")
-
-            st.session_state["results"] = {
-                "images": images,
-                "packaging_text": packaging_text,
-                "hebrew_content": hebrew_content,
-                "filename": display_filename,
-                "bg_removed": bg_removed,
-            }
+        st.session_state["run_id"] = st.session_state.get("run_id", 0) + 1
+        st.session_state["results"] = {
+            "groups": groups,
+            "ext": "png" if transparent_output else "jpg",
+            "zip_name": Path(uploaded_files[0].name).stem if len(uploaded_files) == 1 else "packaging_batch",
+            "scale": scale,
+            "all_ai": all_ai,
+        }
 
     except anthropic.AuthenticationError:
         st.error("API Key לא תקין. בדוק את המפתח ונסה שוב.")
@@ -583,59 +691,86 @@ if run_btn and uploaded:
         st.error(f"שגיאה: {e}")
         st.stop()
 
-# ── Show results ──
-results = st.session_state.get("results")
-if results:
-    images = results["images"]
-    packaging_text = results["packaging_text"]
-    hebrew_content = results["hebrew_content"]
-    filename = results["filename"]
-    bg_removed = results.get("bg_removed", False)
 
+# ── Show results ──
+def _set_all_selection(keys: list[str], value: bool):
+    for k in keys:
+        st.session_state[k] = value
+
+
+@st.fragment
+def render_gallery(results: dict, run_id: int):
+    """Image grid with per-image checkboxes + download buttons.
+    A fragment, so ticking a checkbox doesn't rerun the whole app."""
+    groups = results["groups"]
+    ext = results["ext"]
+    keys = {(g, i): f"sel_{run_id}_{g}_{i}" for g, group in enumerate(groups) for i in range(len(group["images"]))}
+
+    b1, b2 = st.columns(2)
+    b1.button("☑️ בחר הכל", on_click=_set_all_selection, args=(list(keys.values()), True), use_container_width=True)
+    b2.button("✖️ נקה בחירה", on_click=_set_all_selection, args=(list(keys.values()), False), use_container_width=True)
+
+    for g, group in enumerate(groups):
+        st.markdown(f"**📄 {group['name']}** – {len(group['images'])} תמונות")
+        if not group["images"]:
+            st.caption("לא נמצאו תמונות מוצר בקובץ הזה")
+            continue
+        cols = st.columns(3)
+        for i, img in enumerate(group["images"]):
+            with cols[i % 3]:
+                st.image(img["thumb"], use_container_width=True)
+                st.checkbox(f"תמונה {i+1} · {img['width']}×{img['height']}", key=keys[(g, i)])
+
+    selected = {gi for gi, k in keys.items() if st.session_state.get(k)}
+    st.markdown("---")
+    has_text = any(group["hebrew"] for group in groups)
+    st.download_button(
+        label=f"📦 הורד הכל ({len(keys)} תמונות{' + טקסטים' if has_text else ''})",
+        data=lambda: create_zip(groups, ext),  # built only when clicked
+        file_name=f"{results['zip_name']}_processed.zip",
+        mime="application/zip",
+        use_container_width=True,
+        on_click="ignore",
+        disabled=not keys,
+    )
+    st.download_button(
+        label=f"✅ הורד נבחרות ({len(selected)})",
+        data=lambda sel=frozenset(selected): create_zip(groups, ext, set(sel)),
+        file_name=f"{results['zip_name']}_selected.zip",
+        mime="application/zip",
+        use_container_width=True,
+        on_click="ignore",
+        disabled=not selected,
+    )
+
+
+results = st.session_state.get("results")
+if results and "groups" in results:
+    groups = results["groups"]
     with col2:
         st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown('<div class="section-title"><span class="step-badge">2</span> תמונות מוצר נקיות</div>', unsafe_allow_html=True)
-
-        if images:
-            img_cols = st.columns(min(len(images), 3))
-            for i, img_data in enumerate(images[:6]):
-                with img_cols[i % 3]:
-                    pil_img = Image.open(io.BytesIO(img_data["bytes"]))
-                    st.image(pil_img, caption=f"תמונה {i+1}", use_container_width=True)
-        else:
-            st.warning("לא נמצאו תמונות מוצר מוטמעות ב-PDF")
+        st.markdown('<div class="section-title"><span class="step-badge">2</span> תמונות מוצר והורדה</div>', unsafe_allow_html=True)
+        if not results["all_ai"]:
+            st.warning("מודל ההגדלה החכמה לא נטען – חלק מהתמונות הוגדלו בשיטה רגילה (Lanczos).")
+        render_gallery(results, st.session_state.get("run_id", 0))
         st.markdown('</div>', unsafe_allow_html=True)
 
-        download_step = 3
-        if hebrew_content:
+        text_groups = [group for group in groups if group["hebrew"]]
+        if text_groups:
             st.markdown('<div class="card">', unsafe_allow_html=True)
             st.markdown('<div class="section-title"><span class="step-badge">3</span> תוכן שיווקי – עברית</div>', unsafe_allow_html=True)
-
-            if packaging_text:
-                with st.expander("טקסט אנגלי שחולץ מהאריזה"):
-                    st.text(packaging_text)
-
-            st.markdown(f'<div class="hebrew-content">{hebrew_content.replace(chr(10), "<br>")}</div>', unsafe_allow_html=True)
-            st.code(hebrew_content, language=None)
+            for group in text_groups:
+                with st.expander(f"📄 {group['name']}", expanded=len(text_groups) == 1):
+                    if group["packaging_text"]:
+                        with st.popover("טקסט אנגלי שחולץ מהאריזה"):
+                            st.text(group["packaging_text"])
+                    st.markdown(f'<div class="hebrew-content">{group["hebrew"].replace(chr(10), "<br>")}</div>', unsafe_allow_html=True)
+                    st.code(group["hebrew"], language=None)
             st.markdown('</div>', unsafe_allow_html=True)
-            download_step = 4
 
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown(f'<div class="section-title"><span class="step-badge">{download_step}</span> הורדה</div>', unsafe_allow_html=True)
-        zip_bytes = create_zip(images, hebrew_content, bg_removed)
-        zip_label = "הורד ZIP (תמונות + תוכן עברי)" if hebrew_content else "הורד ZIP (תמונות)"
-        st.download_button(
-            label=zip_label,
-            data=zip_bytes,
-            file_name=f"{Path(filename).stem}_processed.zip",
-            mime="application/zip",
-            use_container_width=True,
-        )
-        st.markdown('</div>', unsafe_allow_html=True)
-
-elif not uploaded:
+elif not uploaded_files:
     with col2:
         st.markdown('<div class="card" style="min-height:300px; display:flex; align-items:center; justify-content:center; flex-direction:column; color:#aaa;">', unsafe_allow_html=True)
         st.markdown("### 📦")
-        st.markdown("תוצאות יופיעו כאן לאחר עיבוד ה-PDF")
+        st.markdown("תוצאות יופיעו כאן לאחר העיבוד")
         st.markdown('</div>', unsafe_allow_html=True)
