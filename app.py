@@ -247,24 +247,44 @@ def resize_to_square(img_bytes: bytes, size: int | None = None) -> bytes:
 def get_rembg_session():
     """Load a lightweight rembg model once. Newer rembg versions default to
     bria-rmbg (~1GB), which crashes Streamlit Cloud's memory limit."""
+    import onnxruntime as ort
     from rembg import new_session
-    return new_session("isnet-general-use")
+    opts = ort.SessionOptions()
+    opts.enable_cpu_mem_arena = False  # the arena only grows; never hands memory back
+    opts.enable_mem_pattern = False
+    return new_session("isnet-general-use", sess_opts=opts)
+
+
+MASK_WORK_SIDE = 1024  # isnet runs at 1024×1024 internally, so a bigger input adds no detail
+
+
+def _foreground_mask(img: Image.Image) -> Image.Image:
+    """Run rembg on a small copy and scale the mask back up. rembg's own
+    full-resolution post-processing is what pushed memory over the limit."""
+    from rembg import remove
+    small = img.convert("RGB")
+    if max(small.size) > MASK_WORK_SIDE:
+        small.thumbnail((MASK_WORK_SIDE, MASK_WORK_SIDE), Image.LANCZOS)
+    mask = remove(small, session=get_rembg_session(), only_mask=True)
+    return mask.convert("L").resize(img.size, Image.LANCZOS)
 
 
 def remove_background(img_bytes: bytes) -> bytes:
     """Remove background using rembg. Returns PNG bytes with transparency."""
-    from rembg import remove
-    return remove(img_bytes, session=get_rembg_session())
+    img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+    out = img.convert("RGBA")
+    out.putalpha(_foreground_mask(img))
+    buf = io.BytesIO()
+    out.save(buf, format="PNG")
+    return buf.getvalue()
 
 
 def remove_background_to_white(img_bytes: bytes) -> bytes:
     """Remove background and composite the product onto a clean white canvas.
     Returns JPG bytes."""
-    from rembg import remove
-    no_bg = remove(img_bytes, session=get_rembg_session())
-    fg = Image.open(io.BytesIO(no_bg)).convert("RGBA")
-    white = Image.new("RGB", fg.size, (255, 255, 255))
-    white.paste(fg, mask=fg.split()[3])
+    img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+    white = Image.new("RGB", img.size, (255, 255, 255))
+    white.paste(img, mask=_foreground_mask(img))
     buf = io.BytesIO()
     white.save(buf, format="JPEG", quality=95)
     return buf.getvalue()
